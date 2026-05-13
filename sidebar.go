@@ -275,7 +275,7 @@ func (m sidebarModel) updateList(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.prevItem()
 		case "down", "j":
 			m.nextItem()
-		case "enter", " ":
+		case "enter", " ", "o":
 			if it := m.currentItem(); it != nil {
 				return m, m.doSwitch(*it)
 			}
