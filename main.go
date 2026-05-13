@@ -103,11 +103,12 @@ func setupTmuxSession() {
 		"#[align=centre]#{pane_title}").Run()
 	exec.Command("tmux", "select-pane", "-t", "gw:active.0", "-T", "").Run()
 
-	// Sub-window keybindings (^b c/x/n/p).
+	// Sub-window keybindings (^a c/x/n/p) and sidebar focus (^a s).
 	exec.Command("tmux", "bind-key", "c", "run-shell", bin+" --new-subwindow").Run()
 	exec.Command("tmux", "bind-key", "x", "run-shell", bin+" --close-subwindow").Run()
 	exec.Command("tmux", "bind-key", "n", "run-shell", bin+" --next-subwindow").Run()
 	exec.Command("tmux", "bind-key", "p", "run-shell", bin+" --prev-subwindow").Run()
+	exec.Command("tmux", "bind-key", "s", "select-pane", "-t", "gw:active.0").Run()
 
 	cmd := exec.Command("tmux", "attach-session", "-t", "gw")
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr

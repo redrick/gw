@@ -165,7 +165,7 @@ func switchToWindow(fromTitle, toTitle, toPath string, st State) {
 			}
 		}
 		exec.Command("tmux", "select-pane", "-t", "gw:active.1", "-T", "").Run()
-		exec.Command("tmux", "select-pane", "-t", "gw:active.0").Run()
+		exec.Command("tmux", "select-pane", "-t", "gw:active.1").Run()
 		return
 	}
 
@@ -199,7 +199,7 @@ func switchToWindow(fromTitle, toTitle, toPath string, st State) {
 		"-t", "gw:"+toSub+".0").Run()
 
 	updateStatusBar(toTitle, toSub)
-	exec.Command("tmux", "select-pane", "-t", "gw:active.0").Run()
+	exec.Command("tmux", "select-pane", "-t", "gw:active.1").Run()
 }
 
 // ── Git worktrees ─────────────────────────────────────────────────────────────
@@ -346,6 +346,33 @@ func branchExists(projectPath, branch string) bool {
 	out, err := exec.Command("git", "-C", projectPath, "branch", "-r",
 		"--list", "*/"+branch).Output()
 	return err == nil && strings.TrimSpace(string(out)) != ""
+}
+
+func removeWorktree(projectPath, wtPath, title string, isActive bool, st State) error {
+	if wtPath == projectPath {
+		return fmt.Errorf("cannot remove main worktree")
+	}
+
+	if isActive {
+		// Swap the pane back to its storage window before we kill it.
+		activeSub := activeSubForTitle(st, title)
+		if tmuxWindowExists(activeSub) {
+			exec.Command("tmux", "swap-pane",
+				"-s", "gw:active.1",
+				"-t", "gw:"+activeSub+".0").Run()
+		}
+	}
+
+	out, err := exec.Command("git", "-C", projectPath, "worktree", "remove", wtPath).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%s", strings.TrimSpace(string(out)))
+	}
+
+	for _, win := range subWindowsForTitle(title) {
+		exec.Command("tmux", "kill-window", "-t", "gw:"+win).Run()
+	}
+
+	return nil
 }
 
 func addWorktree(projectPath, projectName, branch string) (Worktree, string, error) {

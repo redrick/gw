@@ -68,6 +68,15 @@ const (
 	viewList       sidebarView = iota
 	viewCreate
 	viewAddProject
+	viewConfirm
+)
+
+type pendingKind int
+
+const (
+	pendingNone            pendingKind = iota
+	pendingRemoveWorktree
+	pendingRemoveProject
 )
 
 type worktreeAdded struct {
@@ -82,21 +91,29 @@ type projectAdded struct {
 	err  error
 }
 
+type worktreeRemoved struct {
+	title     string
+	wasActive bool
+	err       error
+}
+
 type switchedMsg struct {
 	title string
 }
 
 type sidebarModel struct {
-	items   []listItem
-	cursor  int
-	view    sidebarView
-	input   textinput.Model
-	inErr   string
-	state   State
-	width   int
-	height  int
-	windows map[string]bool
-	ready   bool
+	items         []listItem
+	cursor        int
+	view          sidebarView
+	input         textinput.Model
+	inErr         string
+	state         State
+	width         int
+	height        int
+	windows       map[string]bool
+	ready         bool
+	pending       pendingKind
+	pendingItem   listItem
 }
 
 func newSidebarModel() sidebarModel {
@@ -253,6 +270,40 @@ func (m sidebarModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.input.Blur()
 		m.inErr = ""
 		return m, nil
+	case worktreeRemoved:
+		if msg.err != nil {
+			m.inErr = msg.err.Error()
+			return m, nil
+		}
+		st := loadState()
+		if st.ActiveSub != nil {
+			delete(st.ActiveSub, msg.title)
+		}
+		if st.ActiveTitle == msg.title {
+			st.ActiveTitle = ""
+		}
+		saveState(st)
+		m.state = st
+		// Remove the item from the list.
+		for i, it := range m.items {
+			if !it.isHeader && !it.isShell && it.title == msg.title {
+				m.items = append(m.items[:i], m.items[i+1:]...)
+				if m.cursor >= len(m.items) {
+					m.cursor = len(m.items) - 1
+				}
+				break
+			}
+		}
+		if m.cursor < len(m.items) && m.items[m.cursor].isHeader {
+			m.nextItem()
+		}
+		m.windows = liveWindows()
+		if msg.wasActive {
+			if it := m.currentItem(); it != nil {
+				return m, m.doSwitch(*it)
+			}
+		}
+		return m, nil
 	}
 
 	switch m.view {
@@ -260,6 +311,8 @@ func (m sidebarModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.updateCreate(msg)
 	case viewAddProject:
 		return m.updateAddProject(msg)
+	case viewConfirm:
+		return m.updateConfirm(msg)
 	default:
 		return m.updateList(msg)
 	}
@@ -268,6 +321,7 @@ func (m sidebarModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m sidebarModel) updateList(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
+		m.inErr = ""
 		switch msg.String() {
 		case "ctrl+c", "q":
 			return m, tea.Quit
@@ -295,50 +349,23 @@ func (m sidebarModel) updateList(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.input.Placeholder = "/path/to/repo"
 			m.input.Focus()
 			return m, textinput.Blink
+		case "D":
+			if it := m.currentItem(); it != nil && !it.isShell {
+				if it.worktree.Path == it.project.Path {
+					m.inErr = "cannot remove main worktree"
+					return m, nil
+				}
+				m.pending = pendingRemoveWorktree
+				m.pendingItem = *it
+				m.view = viewConfirm
+				return m, nil
+			}
 		case "d":
 			if it := m.currentItem(); it != nil && !it.isShell {
-				proj := it.project
-				activeInRemoved := false
-				for _, item := range m.items {
-					if !item.isHeader && !item.isShell && item.title == m.state.ActiveTitle && item.project.Path == proj.Path {
-						activeInRemoved = true
-						break
-					}
-				}
-				st := loadState()
-				st.RemoveProject(proj.Path)
-				saveState(st)
-				m.state = st
-				m.items = buildItems(st)
-				m.windows = liveWindows()
-				if len(m.items) == 0 {
-					m.cursor = 0
-				} else {
-					if m.cursor >= len(m.items) {
-						m.cursor = len(m.items) - 1
-					}
-					found := false
-					for i := m.cursor; i < len(m.items); i++ {
-						if !m.items[i].isHeader {
-							m.cursor = i
-							found = true
-							break
-						}
-					}
-					if !found {
-						for i := m.cursor - 1; i >= 0; i-- {
-							if !m.items[i].isHeader {
-								m.cursor = i
-								break
-							}
-						}
-					}
-				}
-				if activeInRemoved {
-					if first := m.currentItem(); first != nil {
-						return m, m.doSwitch(*first)
-					}
-				}
+				m.pending = pendingRemoveProject
+				m.pendingItem = *it
+				m.view = viewConfirm
+				return m, nil
 			}
 		case "r":
 			m.refresh()
@@ -390,6 +417,12 @@ func (m sidebarModel) updateAddProject(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.input.Blur()
 			m.inErr = ""
 			return m, nil
+		case "tab":
+			if completed := tabComplete(m.input.Value()); completed != m.input.Value() {
+				m.input.SetValue(completed)
+				m.input.CursorEnd()
+			}
+			return m, nil
 		case "enter":
 			raw := strings.TrimSpace(m.input.Value())
 			if raw == "" {
@@ -421,13 +454,173 @@ func (m sidebarModel) updateAddProject(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
+func (m sidebarModel) updateConfirm(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case tea.KeyMsg:
+		switch msg.String() {
+		case "ctrl+c":
+			return m, tea.Quit
+		case "esc", "n":
+			m.view = viewList
+			m.pending = pendingNone
+			return m, nil
+		case "y":
+			switch m.pending {
+			case pendingRemoveWorktree:
+				it := m.pendingItem
+				isActive := it.title == m.state.ActiveTitle
+				proj := it.project
+				wt := it.worktree
+				title := it.title
+				st := m.state
+				m.view = viewList
+				m.pending = pendingNone
+				return m, func() tea.Msg {
+					err := removeWorktree(proj.Path, wt.Path, title, isActive, st)
+					return worktreeRemoved{title: title, wasActive: isActive, err: err}
+				}
+			case pendingRemoveProject:
+				proj := m.pendingItem.project
+				activeInRemoved := false
+				for _, item := range m.items {
+					if !item.isHeader && !item.isShell && item.title == m.state.ActiveTitle && item.project.Path == proj.Path {
+						activeInRemoved = true
+						break
+					}
+				}
+				st := loadState()
+				st.RemoveProject(proj.Path)
+				saveState(st)
+				m.state = st
+				m.items = buildItems(st)
+				m.windows = liveWindows()
+				m.view = viewList
+				m.pending = pendingNone
+				if len(m.items) == 0 {
+					m.cursor = 0
+				} else {
+					if m.cursor >= len(m.items) {
+						m.cursor = len(m.items) - 1
+					}
+					found := false
+					for i := m.cursor; i < len(m.items); i++ {
+						if !m.items[i].isHeader {
+							m.cursor = i
+							found = true
+							break
+						}
+					}
+					if !found {
+						for i := m.cursor - 1; i >= 0; i-- {
+							if !m.items[i].isHeader {
+								m.cursor = i
+								break
+							}
+						}
+					}
+				}
+				if activeInRemoved {
+					if first := m.currentItem(); first != nil {
+						return m, m.doSwitch(*first)
+					}
+				}
+				return m, nil
+			}
+		}
+	}
+	return m, nil
+}
+
+func (m sidebarModel) viewConfirm() string {
+	var sb strings.Builder
+	switch m.pending {
+	case pendingRemoveWorktree:
+		sb.WriteString(errStyle.Render("remove worktree?") + "\n\n")
+		sb.WriteString(dimStyle.Render("branch: ") + normalStyle.Render(m.pendingItem.worktree.Branch) + "\n")
+		sb.WriteString(dimStyle.Render("path:   ") + dimStyle.Render(truncate(m.pendingItem.worktree.Path, m.width-9)) + "\n")
+	case pendingRemoveProject:
+		sb.WriteString(errStyle.Render("remove project?") + "\n\n")
+		sb.WriteString(dimStyle.Render("project: ") + normalStyle.Render(m.pendingItem.project.Name) + "\n")
+		sb.WriteString(dimStyle.Render("path:    ") + dimStyle.Render(truncate(m.pendingItem.project.Path, m.width-10)) + "\n")
+	}
+	sb.WriteString("\n" + helpStyle.Render("y  confirm   n / esc  cancel"))
+	return sb.String()
+}
+
 func expandHome(path string) string {
-	if strings.HasPrefix(path, "~/") {
+	if path == "~" || strings.HasPrefix(path, "~/") {
 		if home, err := os.UserHomeDir(); err == nil {
+			if path == "~" {
+				return home
+			}
 			return filepath.Join(home, path[2:])
 		}
 	}
 	return path
+}
+
+func tabComplete(raw string) string {
+	path := expandHome(raw)
+
+	var dir, prefix string
+	switch {
+	case path == "":
+		dir, prefix = ".", ""
+	case strings.HasSuffix(path, "/"):
+		dir, prefix = path, ""
+	default:
+		dir, prefix = filepath.Dir(path), filepath.Base(path)
+	}
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return raw
+	}
+
+	var matches []string
+	for _, e := range entries {
+		if e.IsDir() && strings.HasPrefix(e.Name(), prefix) {
+			matches = append(matches, filepath.Join(dir, e.Name())+"/")
+		}
+	}
+
+	if len(matches) == 0 {
+		return raw
+	}
+
+	result := matches[0]
+	for _, m := range matches[1:] {
+		result = commonPrefix(result, m)
+	}
+
+	return reTilde(result)
+}
+
+func reTilde(path string) string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return path
+	}
+	if path == home || path == home+"/" {
+		return "~/"
+	}
+	if strings.HasPrefix(path, home+"/") {
+		return "~/" + path[len(home)+1:]
+	}
+	return path
+}
+
+func commonPrefix(a, b string) string {
+	n := len(a)
+	if len(b) < n {
+		n = len(b)
+	}
+	for i := 0; i < n; i++ {
+		if a[i] != b[i] {
+			return a[:i]
+		}
+	}
+	return a[:n]
 }
 
 func (m sidebarModel) doSwitch(it listItem) tea.Cmd {
@@ -456,6 +649,8 @@ func (m sidebarModel) View() string {
 		return m.viewCreate()
 	case viewAddProject:
 		return m.viewAddProject()
+	case viewConfirm:
+		return m.viewConfirm()
 	default:
 		return m.viewList()
 	}
@@ -470,6 +665,9 @@ func (m sidebarModel) viewList() string {
 	var sb strings.Builder
 	sb.WriteString(sectionStyle.Render("worktrees") + "\n")
 	sb.WriteString(dimStyle.Render(strings.Repeat("─", w-1)) + "\n")
+	if m.inErr != "" {
+		sb.WriteString(errStyle.Render("! "+truncate(m.inErr, w-3)) + "\n")
+	}
 
 	for i, it := range m.items {
 		if it.isHeader {
@@ -535,14 +733,22 @@ func (m sidebarModel) viewList() string {
 
 	div := dimStyle.Render(strings.Repeat("─", w-1))
 	footer := div + "\n" +
-		helpStyle.Render("↑↓ / k j  move   enter  open") + "\n" +
-		helpStyle.Render("n  new wt   a  add proj") + "\n" +
-		helpStyle.Render("d  remove   r  refresh   q  quit") + "\n" +
+		sectionStyle.Render("gw") + "\n" +
+		helpStyle.Render("↑↓ / k j  move") + "\n" +
+		helpStyle.Render("enter / o  open") + "\n" +
+		helpStyle.Render("n  new worktree") + "\n" +
+		helpStyle.Render("a  add project") + "\n" +
+		helpStyle.Render("D  rm worktree") + "\n" +
+		helpStyle.Render("d  rm project") + "\n" +
+		helpStyle.Render("r  refresh") + "\n" +
+		helpStyle.Render("q  quit") + "\n" +
 		div + "\n" +
 		sectionStyle.Render("tmux") + "\n" +
-		helpStyle.Render("^a c  new   ^a x  close") + "\n" +
-		helpStyle.Render("^a n  next   ^a p  prev") + "\n" +
-		helpStyle.Render("^a [  scroll mode   ^a d  detach")
+		helpStyle.Render("^a c  new") + "\n" +
+		helpStyle.Render("^a n  next") + "\n" +
+		helpStyle.Render("^a p  prev") + "\n" +
+		helpStyle.Render("^a s  sidebar") + "\n" +
+		helpStyle.Render("^a [  scroll mode")
 
 	contentLines := strings.Count(content, "\n")
 	footerLines := strings.Count(footer, "\n") + 1
