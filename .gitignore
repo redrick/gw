@@ -1,6 +1,9 @@
 # compiled binary
 gw
 
+# local Claude Code settings
+.claude/
+
 # Go build artifacts
 *.exe
 *.exe~

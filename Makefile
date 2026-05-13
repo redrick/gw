@@ -1,12 +1,10 @@
 BIN := gw
-PREFIX := $(HOME)/Projects/golang/bin
 
 build:
 	go build -o $(BIN) .
 
-install: build
-	mkdir -p $(PREFIX)
-	cp $(BIN) $(PREFIX)/$(BIN)
+install:
+	go install .
 
 clean:
 	rm -f $(BIN)
