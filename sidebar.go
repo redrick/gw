@@ -94,6 +94,7 @@ type sidebarModel struct {
 	inErr   string
 	state   State
 	width   int
+	height  int
 	windows map[string]bool
 	ready   bool
 }
@@ -193,6 +194,7 @@ func (m sidebarModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
+		m.height = msg.Height
 		if !m.ready {
 			m.ready = true
 			if it := m.currentItem(); it != nil {
@@ -529,11 +531,30 @@ func (m sidebarModel) viewList() string {
 		sb.WriteString(dimStyle.Render("  run gw from a git repo\n"))
 	}
 
-	sb.WriteString("\n" + helpStyle.Render("↑↓  move   enter  open\nn  new   a  add proj\nd  remove   r  refresh   q  quit"))
-	sb.WriteString("\n\n" + dimStyle.Render(strings.Repeat("─", w-1)) + "\n")
-	sb.WriteString(sectionStyle.Render("tmux") + "\n")
-	sb.WriteString(helpStyle.Render("^a c  new window\n^a x  close window\n^a n  next   ^a p  prev\n^a [  scroll   q  exit\n^a d  detach"))
-	return sb.String()
+	content := sb.String()
+
+	div := dimStyle.Render(strings.Repeat("─", w-1))
+	footer := div + "\n" +
+		helpStyle.Render("↑↓ / k j  move   enter  open") + "\n" +
+		helpStyle.Render("n  new wt   a  add proj") + "\n" +
+		helpStyle.Render("d  remove   r  refresh   q  quit") + "\n" +
+		div + "\n" +
+		sectionStyle.Render("tmux") + "\n" +
+		helpStyle.Render("^a c  new   ^a x  close") + "\n" +
+		helpStyle.Render("^a n  next   ^a p  prev") + "\n" +
+		helpStyle.Render("^a [  scroll mode   ^a d  detach")
+
+	contentLines := strings.Count(content, "\n")
+	footerLines := strings.Count(footer, "\n") + 1
+	h := m.height
+	if h < 10 {
+		h = 40
+	}
+	gap := h - contentLines - footerLines
+	if gap < 1 {
+		gap = 1
+	}
+	return content + strings.Repeat("\n", gap) + footer
 }
 
 func (m sidebarModel) viewCreate() string {
