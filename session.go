@@ -59,6 +59,16 @@ func (st *State) AddProject(path string) {
 	})
 }
 
+func (st *State) RemoveProject(path string) {
+	var kept []Project
+	for _, p := range st.Projects {
+		if p.Path != path {
+			kept = append(kept, p)
+		}
+	}
+	st.Projects = kept
+}
+
 // ── Tmux pane management ──────────────────────────────────────────────────────
 //
 // Each worktree gets a hidden tmux window ("storage window") that holds its

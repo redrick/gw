@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 
 	"github.com/charmbracelet/bubbles/textinput"
@@ -64,8 +65,9 @@ func buildItems(st State) []listItem {
 type sidebarView int
 
 const (
-	viewList   sidebarView = iota
+	viewList       sidebarView = iota
 	viewCreate
+	viewAddProject
 )
 
 type worktreeAdded struct {
@@ -73,6 +75,11 @@ type worktreeAdded struct {
 	title string
 	proj  Project
 	err   error
+}
+
+type projectAdded struct {
+	path string
+	err  error
 }
 
 type switchedMsg struct {
@@ -227,12 +234,33 @@ func (m sidebarModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.input.Blur()
 		m.windows = liveWindows()
 		return m, m.doSwitch(item)
+	case projectAdded:
+		if msg.err != nil {
+			m.inErr = msg.err.Error()
+			return m, nil
+		}
+		m.state = loadState()
+		m.items = buildItems(m.state)
+		for i, it := range m.items {
+			if !it.isHeader && it.project.Path == msg.path {
+				m.cursor = i
+				break
+			}
+		}
+		m.view = viewList
+		m.input.Blur()
+		m.inErr = ""
+		return m, nil
 	}
 
-	if m.view == viewCreate {
+	switch m.view {
+	case viewCreate:
 		return m.updateCreate(msg)
+	case viewAddProject:
+		return m.updateAddProject(msg)
+	default:
+		return m.updateList(msg)
 	}
-	return m.updateList(msg)
 }
 
 func (m sidebarModel) updateList(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -254,8 +282,61 @@ func (m sidebarModel) updateList(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.view = viewCreate
 				m.inErr = ""
 				m.input.SetValue("")
+				m.input.Placeholder = "branch-name"
 				m.input.Focus()
 				return m, textinput.Blink
+			}
+		case "a":
+			m.view = viewAddProject
+			m.inErr = ""
+			m.input.SetValue("")
+			m.input.Placeholder = "/path/to/repo"
+			m.input.Focus()
+			return m, textinput.Blink
+		case "d":
+			if it := m.currentItem(); it != nil && !it.isShell {
+				proj := it.project
+				activeInRemoved := false
+				for _, item := range m.items {
+					if !item.isHeader && !item.isShell && item.title == m.state.ActiveTitle && item.project.Path == proj.Path {
+						activeInRemoved = true
+						break
+					}
+				}
+				st := loadState()
+				st.RemoveProject(proj.Path)
+				saveState(st)
+				m.state = st
+				m.items = buildItems(st)
+				m.windows = liveWindows()
+				if len(m.items) == 0 {
+					m.cursor = 0
+				} else {
+					if m.cursor >= len(m.items) {
+						m.cursor = len(m.items) - 1
+					}
+					found := false
+					for i := m.cursor; i < len(m.items); i++ {
+						if !m.items[i].isHeader {
+							m.cursor = i
+							found = true
+							break
+						}
+					}
+					if !found {
+						for i := m.cursor - 1; i >= 0; i-- {
+							if !m.items[i].isHeader {
+								m.cursor = i
+								break
+							}
+						}
+					}
+				}
+				if activeInRemoved {
+					if first := m.currentItem(); first != nil {
+						return m, m.doSwitch(*first)
+					}
+				}
 			}
 		case "r":
 			m.refresh()
@@ -296,6 +377,57 @@ func (m sidebarModel) updateCreate(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
+func (m sidebarModel) updateAddProject(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case tea.KeyMsg:
+		switch msg.String() {
+		case "ctrl+c":
+			return m, tea.Quit
+		case "esc":
+			m.view = viewList
+			m.input.Blur()
+			m.inErr = ""
+			return m, nil
+		case "enter":
+			raw := strings.TrimSpace(m.input.Value())
+			if raw == "" {
+				return m, nil
+			}
+			return m, func() tea.Msg {
+				path := expandHome(raw)
+				if !isGitRepo(path) {
+					return projectAdded{err: fmt.Errorf("not a git repository: %s", path)}
+				}
+				root, err := gitRepoRoot(path)
+				if err != nil {
+					return projectAdded{err: err}
+				}
+				st := loadState()
+				for _, p := range st.Projects {
+					if p.Path == root {
+						return projectAdded{err: fmt.Errorf("already tracked: %s", filepath.Base(root))}
+					}
+				}
+				st.AddProject(root)
+				saveState(st)
+				return projectAdded{path: root}
+			}
+		}
+	}
+	var cmd tea.Cmd
+	m.input, cmd = m.input.Update(msg)
+	return m, cmd
+}
+
+func expandHome(path string) string {
+	if strings.HasPrefix(path, "~/") {
+		if home, err := os.UserHomeDir(); err == nil {
+			return filepath.Join(home, path[2:])
+		}
+	}
+	return path
+}
+
 func (m sidebarModel) doSwitch(it listItem) tea.Cmd {
 	from := m.state.ActiveTitle
 	title := it.title
@@ -317,10 +449,14 @@ func (m sidebarModel) doSwitch(it listItem) tea.Cmd {
 // ── View ──────────────────────────────────────────────────────────────────────
 
 func (m sidebarModel) View() string {
-	if m.view == viewCreate {
+	switch m.view {
+	case viewCreate:
 		return m.viewCreate()
+	case viewAddProject:
+		return m.viewAddProject()
+	default:
+		return m.viewList()
 	}
-	return m.viewList()
 }
 
 func (m sidebarModel) viewList() string {
@@ -393,7 +529,7 @@ func (m sidebarModel) viewList() string {
 		sb.WriteString(dimStyle.Render("  run gw from a git repo\n"))
 	}
 
-	sb.WriteString("\n" + helpStyle.Render("↑↓  move   enter  open\nn  new     r  refresh   q  quit"))
+	sb.WriteString("\n" + helpStyle.Render("↑↓  move   enter  open\nn  new   a  add proj\nd  remove   r  refresh   q  quit"))
 	sb.WriteString("\n\n" + dimStyle.Render(strings.Repeat("─", w-1)) + "\n")
 	sb.WriteString(sectionStyle.Render("tmux") + "\n")
 	sb.WriteString(helpStyle.Render("^a c  new window\n^a x  close window\n^a n  next   ^a p  prev\n^a [  scroll   q  exit\n^a d  detach"))
@@ -412,6 +548,17 @@ func (m sidebarModel) viewCreate() string {
 		sb.WriteString("\n" + errStyle.Render(truncate(m.inErr, m.width-2)) + "\n")
 	}
 	sb.WriteString("\n" + helpStyle.Render("enter  create   esc  cancel"))
+	return sb.String()
+}
+
+func (m sidebarModel) viewAddProject() string {
+	var sb strings.Builder
+	sb.WriteString(sectionStyle.Render("add project") + "\n\n")
+	sb.WriteString("path: " + m.input.View() + "\n")
+	if m.inErr != "" {
+		sb.WriteString("\n" + errStyle.Render(truncate(m.inErr, m.width-2)) + "\n")
+	}
+	sb.WriteString("\n" + helpStyle.Render("enter  add   esc  cancel"))
 	return sb.String()
 }
 
