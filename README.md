@@ -78,6 +78,8 @@ PR support depends on the GitHub CLI (`gh`). Install it, authenticate with `gh a
 
 Branches with an open PR show the PR number in the sidebar. Select that branch and press `P` to open a tmux popup with the PR overview, comments, and diff.
 
+Inside PR details, use `tab`/arrow keys to switch between the conversation and files changed views. In the conversation view, use `n`/`p` to select the description or a comment, `e` to edit the selected text, `c` to add a new comment, and `ctrl+s` to save changes via GitHub.
+
 ![PR details](pr-details.svg)
 
 ### Create a PR

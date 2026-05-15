@@ -923,28 +923,68 @@ func openPRPopup(path string) tea.Cmd {
 	}
 }
 
+type prEditMode int
+
+const (
+	prEditNone prEditMode = iota
+	prEditNewComment
+	prEditDescription
+	prEditComment
+)
+
+type prComment struct {
+	ID     string `json:"id"`
+	Author struct {
+		Login string `json:"login"`
+	} `json:"author"`
+	Body      string `json:"body"`
+	CreatedAt string `json:"createdAt"`
+}
+
+type prData struct {
+	ID                                       string `json:"id"`
+	Number                                   int    `json:"number"`
+	Title, State, URL, Body, CreatedAt       string
+	BaseRefName, HeadRefName, ReviewDecision string
+	Author                                   struct {
+		Login string `json:"login"`
+	} `json:"author"`
+	Comments []prComment `json:"comments"`
+}
+
 type prDetailsModel struct {
 	path     string
 	loading  bool
 	tab      int
 	width    int
 	height   int
-	info     string
+	pr       prData
 	diff     string
 	diffTool string
 	err      string
+	status   string
+	selected int // 0 = description, 1..n = comments
+	editing  prEditMode
+	editIdx  int
+	editor   textarea.Model
 	viewport viewport.Model
 }
 
 type prDetailsLoadedMsg struct {
-	info     string
+	pr       prData
 	diff     string
 	diffTool string
 	err      error
 }
 
+type prSavedMsg struct{ err error }
+
 func runPRDetails(path string) {
-	p := tea.NewProgram(prDetailsModel{path: path, loading: true}, tea.WithAltScreen())
+	ta := textarea.New()
+	ta.Placeholder = "Write a PR comment…"
+	ta.ShowLineNumbers = false
+	ta.Focus()
+	p := tea.NewProgram(prDetailsModel{path: path, loading: true, editor: ta}, tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintln(os.Stderr, "gw pr:", err)
 	}
@@ -958,8 +998,30 @@ func (m prDetailsModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width, m.height = msg.Width, msg.Height
 		m.viewport.Width = max(20, msg.Width-4)
 		m.viewport.Height = max(3, msg.Height-7)
+		m.editor.SetWidth(max(20, msg.Width-4))
+		m.editor.SetHeight(max(5, msg.Height-9))
 		m.viewport.SetContent(m.currentPRBody())
 	case tea.KeyMsg:
+		if m.editing != prEditNone {
+			switch msg.String() {
+			case "ctrl+c", "esc":
+				m.editing = prEditNone
+				m.status = "edit cancelled"
+				m.viewport.SetContent(m.currentPRBody())
+				return m, nil
+			case "ctrl+s":
+				body := strings.TrimSpace(m.editor.Value())
+				if body == "" {
+					m.status = "body cannot be empty"
+					return m, nil
+				}
+				m.loading = true
+				return m, savePRText(m.path, m.pr.ID, m.editing, m.editIdx, m.commentID(m.editIdx), body)
+			}
+			var cmd tea.Cmd
+			m.editor, cmd = m.editor.Update(msg)
+			return m, cmd
+		}
 		switch msg.String() {
 		case "ctrl+c", "esc", "q":
 			return m, tea.Quit
@@ -968,20 +1030,76 @@ func (m prDetailsModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.viewport.GotoTop()
 			m.viewport.SetContent(m.currentPRBody())
 			return m, nil
+		case "c":
+			if m.tab == 0 && !m.loading && m.err == "" {
+				m.startEdit(prEditNewComment, -1, "")
+				return m, nil
+			}
+		case "e":
+			if m.tab == 0 && !m.loading && m.err == "" {
+				if m.selected == 0 {
+					m.startEdit(prEditDescription, 0, m.pr.Body)
+				} else if m.selected-1 < len(m.pr.Comments) {
+					m.startEdit(prEditComment, m.selected-1, m.pr.Comments[m.selected-1].Body)
+				}
+				return m, nil
+			}
+		case "n":
+			if m.tab == 0 && m.selected < len(m.pr.Comments) {
+				m.selected++
+				m.viewport.SetContent(m.currentPRBody())
+				return m, nil
+			}
+		case "p":
+			if m.tab == 0 && m.selected > 0 {
+				m.selected--
+				m.viewport.SetContent(m.currentPRBody())
+				return m, nil
+			}
 		}
 	case prDetailsLoadedMsg:
 		m.loading = false
 		if msg.err != nil {
 			m.err = msg.err.Error()
+		} else {
+			m.err = ""
+			m.pr = msg.pr
+			m.diff = msg.diff
+			m.diffTool = msg.diffTool
+			if m.selected > len(m.pr.Comments) {
+				m.selected = len(m.pr.Comments)
+			}
 		}
-		m.info = msg.info
-		m.diff = msg.diff
-		m.diffTool = msg.diffTool
 		m.viewport.SetContent(m.currentPRBody())
+	case prSavedMsg:
+		m.loading = false
+		if msg.err != nil {
+			m.status = msg.err.Error()
+			return m, nil
+		}
+		m.editing = prEditNone
+		m.status = "saved"
+		return m, loadPRDetails(m.path)
 	}
 	var cmd tea.Cmd
 	m.viewport, cmd = m.viewport.Update(msg)
 	return m, cmd
+}
+
+func (m *prDetailsModel) startEdit(mode prEditMode, idx int, body string) {
+	m.editing = mode
+	m.editIdx = idx
+	m.editor.SetValue(body)
+	m.editor.CursorEnd()
+	m.editor.Focus()
+	m.status = ""
+}
+
+func (m prDetailsModel) commentID(idx int) string {
+	if idx >= 0 && idx < len(m.pr.Comments) {
+		return m.pr.Comments[idx].ID
+	}
+	return ""
 }
 
 func (m prDetailsModel) View() string {
@@ -989,7 +1107,22 @@ func (m prDetailsModel) View() string {
 	if w < 20 {
 		w = 100
 	}
+	if m.editing != prEditNone {
+		return m.prHeader(w) + "\n" + m.editTitle() + "\n" + m.editor.View() + "\n" + helpStyle.Render("ctrl+s save   esc cancel")
+	}
 	return m.prHeader(w) + "\n" + m.viewport.View() + "\n" + m.prFooter(w)
+}
+
+func (m prDetailsModel) editTitle() string {
+	switch m.editing {
+	case prEditNewComment:
+		return sectionStyle.Render("New comment")
+	case prEditDescription:
+		return sectionStyle.Render("Edit description")
+	case prEditComment:
+		return sectionStyle.Render("Edit comment")
+	}
+	return ""
 }
 
 func (m prDetailsModel) prHeader(w int) string {
@@ -997,7 +1130,11 @@ func (m prDetailsModel) prHeader(w int) string {
 	if m.tab == 1 && m.diffTool != "" {
 		tool = dimStyle.Render("  diff: " + m.diffTool)
 	}
-	return lipgloss.NewStyle().Padding(0, 1).Render(sectionStyle.Render("Pull request")+tool) + "\n" +
+	status := ""
+	if m.status != "" {
+		status = dimStyle.Render("  " + m.status)
+	}
+	return lipgloss.NewStyle().Padding(0, 1).Render(sectionStyle.Render("Pull request")+tool+status) + "\n" +
 		lipgloss.NewStyle().Padding(0, 1).Render(m.tabLabel(0, "Conversation")+"  "+m.tabLabel(1, "Files changed")+dimStyle.Render("   tab/←/→ switch"))
 }
 
@@ -1010,7 +1147,7 @@ func (m prDetailsModel) tabLabel(tab int, label string) string {
 
 func (m prDetailsModel) prFooter(w int) string {
 	pos := fmt.Sprintf("%d%%", int(m.viewport.ScrollPercent()*100))
-	return helpStyle.Render("↑/↓ j/k pgup/pgdn scroll   tab switch tabs   q/esc close   " + pos)
+	return helpStyle.Render("↑/↓ j/k pgup/pgdn scroll   n/p select   c comment   e edit selected   q/esc close   " + pos)
 }
 
 func (m prDetailsModel) currentPRBody() string {
@@ -1021,52 +1158,40 @@ func (m prDetailsModel) currentPRBody() string {
 		return "\n" + dimStyle.Render("Loading PR details…")
 	}
 	if m.tab == 0 {
-		return m.info
+		return renderPRConversation(m.pr, m.selected)
 	}
 	return sideBySideDiff(m.diff, m.viewport.Width)
 }
 
 func loadPRDetails(path string) tea.Cmd {
 	return func() tea.Msg {
-		info, err := prTextInfo(path)
+		pr, err := prLoadData(path)
 		if err != nil {
 			return prDetailsLoadedMsg{err: err}
 		}
 		diff, tool, err := prDiffText(path)
 		if err != nil {
-			return prDetailsLoadedMsg{info: info, err: err}
+			return prDetailsLoadedMsg{pr: pr, err: err}
 		}
-		return prDetailsLoadedMsg{info: info, diff: diff, diffTool: tool}
+		return prDetailsLoadedMsg{pr: pr, diff: diff, diffTool: tool}
 	}
 }
 
-func prTextInfo(path string) (string, error) {
-	type comment struct {
-		Author struct {
-			Login string `json:"login"`
-		} `json:"author"`
-		Body      string `json:"body"`
-		CreatedAt string `json:"createdAt"`
-	}
-	type prView struct {
-		Number                                   int `json:"number"`
-		Title, State, URL, Body, CreatedAt       string
-		BaseRefName, HeadRefName, ReviewDecision string
-		Author                                   struct {
-			Login string `json:"login"`
-		} `json:"author"`
-		Comments []comment `json:"comments"`
-	}
-	cmd := exec.Command("gh", "pr", "view", "--json", "number,title,state,url,author,body,comments,baseRefName,headRefName,createdAt,reviewDecision")
+func prLoadData(path string) (prData, error) {
+	cmd := exec.Command("gh", "pr", "view", "--json", "id,number,title,state,url,author,body,comments,baseRefName,headRefName,createdAt,reviewDecision")
 	cmd.Dir = path
 	out, err := cmd.Output()
 	if err != nil {
-		return "", err
+		return prData{}, err
 	}
-	var pr prView
+	var pr prData
 	if err := json.Unmarshal(out, &pr); err != nil {
-		return "", err
+		return prData{}, err
 	}
+	return pr, nil
+}
+
+func renderPRConversation(pr prData, selected int) string {
 	var sb strings.Builder
 	sb.WriteString(activeStyle.Render(fmt.Sprintf("#%d %s", pr.Number, pr.Title)) + "\n")
 	sb.WriteString(dimStyle.Render(fmt.Sprintf("%s opened by @%s · %s → %s", pr.State, pr.Author.Login, pr.HeadRefName, pr.BaseRefName)) + "\n")
@@ -1075,16 +1200,61 @@ func prTextInfo(path string) (string, error) {
 	}
 	sb.WriteString(dimStyle.Render(pr.URL) + "\n\n")
 
-	sb.WriteString(githubBox("Description", pr.Body))
+	sb.WriteString(prSelectableTitle(selected == 0, "Description") + "\n")
+	sb.WriteString(githubBox("", pr.Body))
 	if len(pr.Comments) > 0 {
 		sb.WriteString("\n" + prDivider("Conversation") + "\n")
 	}
-	for _, c := range pr.Comments {
-		commentTitle := "@" + c.Author.Login + " commented " + c.CreatedAt
-		sb.WriteString("\n" + prDivider(commentTitle) + "\n")
+	for i, c := range pr.Comments {
+		commentTitle := fmt.Sprintf("@%s commented %s", c.Author.Login, c.CreatedAt)
+		sb.WriteString("\n" + prSelectableTitle(selected == i+1, commentTitle) + "\n")
 		sb.WriteString(githubBox("", c.Body))
 	}
-	return sb.String(), nil
+	return sb.String()
+}
+
+func prSelectableTitle(selected bool, label string) string {
+	if selected {
+		return activeStyle.Render("▶ " + label)
+	}
+	return prDivider(label)
+}
+
+func savePRText(path, prID string, mode prEditMode, idx int, commentID, body string) tea.Cmd {
+	return func() tea.Msg {
+		var err error
+		switch mode {
+		case prEditNewComment:
+			err = ghGraphQL(path, `mutation($subject:ID!,$body:String!){addComment(input:{subjectId:$subject,body:$body}){commentEdge{node{id}}}}`, map[string]string{"subject": prID, "body": body})
+		case prEditDescription:
+			err = ghGraphQL(path, `mutation($id:ID!,$body:String!){updatePullRequest(input:{pullRequestId:$id,body:$body}){pullRequest{id}}}`, map[string]string{"id": prID, "body": body})
+		case prEditComment:
+			if commentID == "" {
+				err = fmt.Errorf("selected comment has no editable id")
+			} else {
+				err = ghGraphQL(path, `mutation($id:ID!,$body:String!){updateIssueComment(input:{id:$id,body:$body}){issueComment{id}}}`, map[string]string{"id": commentID, "body": body})
+			}
+		}
+		return prSavedMsg{err: err}
+	}
+}
+
+func ghGraphQL(path, query string, fields map[string]string) error {
+	args := []string{"api", "graphql", "-f", "query=" + query}
+	for k, v := range fields {
+		args = append(args, "-f", k+"="+v)
+	}
+	cmd := exec.Command("gh", args...)
+	cmd.Dir = path
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		msg := strings.TrimSpace(string(out))
+		if msg == "" {
+			msg = err.Error()
+		}
+		return fmt.Errorf("gh: %s", msg)
+	}
+	return nil
 }
 
 func prDiffText(path string) (string, string, error) {
