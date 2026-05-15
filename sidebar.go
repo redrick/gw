@@ -1077,10 +1077,11 @@ func prTextInfo(path string) (string, error) {
 
 	sb.WriteString(githubBox("Description", pr.Body))
 	if len(pr.Comments) > 0 {
-		sb.WriteString("\n" + sectionStyle.Render("Conversation") + "\n")
+		sb.WriteString("\n" + prDivider("Conversation") + "\n")
 	}
 	for _, c := range pr.Comments {
-		sb.WriteString("\n" + lipgloss.NewStyle().Bold(true).Render("@"+c.Author.Login) + dimStyle.Render(" commented "+c.CreatedAt) + "\n")
+		commentTitle := "@" + c.Author.Login + " commented " + c.CreatedAt
+		sb.WriteString("\n" + prDivider(commentTitle) + "\n")
 		sb.WriteString(githubBox("", c.Body))
 	}
 	return sb.String(), nil
@@ -1100,6 +1101,20 @@ func prDiffText(path string) (string, string, error) {
 		return "", "", fmt.Errorf("gh pr diff: %s", msg)
 	}
 	return string(out), "side-by-side", nil
+}
+
+func prDivider(label string) string {
+	const width = 96
+	label = strings.TrimSpace(label)
+	if label == "" {
+		return dimStyle.Render(strings.Repeat("─", width))
+	}
+	prefix := "─ " + label + " "
+	remain := width - lipgloss.Width(prefix)
+	if remain < 1 {
+		remain = 1
+	}
+	return dimStyle.Render(prefix + strings.Repeat("─", remain))
 }
 
 func githubBox(title, body string) string {
