@@ -2,6 +2,7 @@
 
 A terminal-based git worktree manager that runs inside tmux. Navigate between worktrees from a persistent sidebar — each worktree keeps its own live shell, editor session, and running processes while it's in the background.
 
+
 ![screenshot](screenshot.svg)
 
 ## Requirements

@@ -73,6 +73,12 @@ func setupTmuxSession() {
 
 	sh := shellBin()
 	exec.Command("tmux", "split-window", "-t", "gw:active.0", "-h", sh).Run()
+
+	// Keep pane 1 alive even after shell exits (e.g., ^D).
+	exec.Command("tmux", "set-option", "-t", "gw:active.1", "remain-on-exit", "on").Run()
+	// Hook to respawn pane 1 if it dies (fallback if remain-on-exit isn't enough).
+	exec.Command("tmux", "set-hook", "-t", "gw", "pane-dead",
+		"if-shell ' #{pane_index} = 1' 'respawn-pane -k -t gw:active.1'").Run()
 	exec.Command("tmux", "select-pane", "-t", "gw:active.0").Run()
 
 	// Session-scoped options.
@@ -155,7 +161,22 @@ func runCloseSubwindow() {
 	}
 	currentSub := activeSubForTitle(st, baseTitle)
 	subs := subWindowsForTitle(baseTitle)
-	if len(subs) <= 1 {
+	if len(subs) == 1 {
+		// If the current subwindow is the only one left, closing it should return us to the shell.
+		// We need to swap the shell back from the storage window to active.1 before killing the window.
+		if currentSub != baseTitle {
+			exec.Command("tmux", "swap-pane",
+				"-s", "gw:active.1",
+				"-t", "gw:"+currentSub+".0").Run()
+			exec.Command("tmux", "kill-window", "-t", "gw:"+currentSub).Run()
+
+			if st.ActiveSub != nil {
+				delete(st.ActiveSub, baseTitle)
+			}
+			saveState(st)
+			updateStatusBar(baseTitle, "")
+			exec.Command("tmux", "select-pane", "-t", "gw:active.1").Run()
+		}
 		return
 	}
 
@@ -227,4 +248,4 @@ func runNavigateSubwindow(dir int) {
 }
 
 func runNextSubwindow() { runNavigateSubwindow(1) }
-func runPrevSubwindow()  { runNavigateSubwindow(-1) }
+func runPrevSubwindow() { runNavigateSubwindow(-1) }
