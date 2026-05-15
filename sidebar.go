@@ -1,13 +1,17 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 
+	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/textinput"
+	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 )
@@ -19,6 +23,8 @@ var (
 	sectionStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("99")).Bold(true)
 	normalStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("86"))
 	dimStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("243"))
+	branchStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("243")).Italic(true)
+	prStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("214")).Bold(true)
 	helpStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
 	errStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
 )
@@ -27,10 +33,12 @@ var (
 
 type listItem struct {
 	isHeader  bool
-	isShell   bool   // launch dir entry — not a worktree
+	isShell   bool // launch dir entry — not a worktree
 	project   Project
 	worktree  Worktree
-	title     string
+	title     string // The unique identifier (e.g. wt-project-branch)
+	branch    string // The human-readable branch name
+	display   string // Friendly worktree display name
 	shellPath string
 }
 
@@ -47,6 +55,8 @@ func buildItems(st State) []listItem {
 				project:  p,
 				worktree: wt,
 				title:    wtWindowTitle(p.Name, wt.Branch),
+				branch:   wt.Branch,
+				display:  friendlyWorktreeName(p, wt),
 			})
 		}
 	}
@@ -65,16 +75,17 @@ func buildItems(st State) []listItem {
 type sidebarView int
 
 const (
-	viewList       sidebarView = iota
+	viewList sidebarView = iota
 	viewCreate
 	viewAddProject
 	viewConfirm
+	viewPR
 )
 
 type pendingKind int
 
 const (
-	pendingNone            pendingKind = iota
+	pendingNone pendingKind = iota
 	pendingRemoveWorktree
 	pendingRemoveProject
 )
@@ -101,19 +112,28 @@ type switchedMsg struct {
 	title string
 }
 
+type prLoadedMsg struct {
+	content string
+}
+
+type prPopupDoneMsg struct {
+	err error
+}
+
 type sidebarModel struct {
-	items         []listItem
-	cursor        int
-	view          sidebarView
-	input         textinput.Model
-	inErr         string
-	state         State
-	width         int
-	height        int
-	windows       map[string]bool
-	ready         bool
-	pending       pendingKind
-	pendingItem   listItem
+	items       []listItem
+	cursor      int
+	view        sidebarView
+	input       textinput.Model
+	inErr       string
+	state       State
+	width       int
+	height      int
+	windows     map[string]bool
+	ready       bool
+	pending     pendingKind
+	pendingItem listItem
+	prContent   string
 }
 
 func newSidebarModel() sidebarModel {
@@ -230,7 +250,7 @@ func (m sidebarModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		// Add the new worktree to items and switch to it
-		item := listItem{project: msg.proj, worktree: msg.wt, title: msg.title}
+		item := listItem{project: msg.proj, worktree: msg.wt, title: msg.title, branch: msg.wt.Branch, display: friendlyWorktreeName(msg.proj, msg.wt)}
 		// Insert after the last item of this project
 		inserted := false
 		for i := len(m.items) - 1; i >= 0; i-- {
@@ -304,9 +324,19 @@ func (m sidebarModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 		return m, nil
+	case prLoadedMsg:
+		m.prContent = msg.content
+		return m, nil
+	case prPopupDoneMsg:
+		if msg.err != nil {
+			m.inErr = msg.err.Error()
+		}
+		return m, nil
 	}
 
 	switch m.view {
+	case viewPR:
+		return m.updatePR(msg)
 	case viewCreate:
 		return m.updateCreate(msg)
 	case viewAddProject:
@@ -316,6 +346,32 @@ func (m sidebarModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	default:
 		return m.updateList(msg)
 	}
+}
+
+func (m *sidebarModel) updatePR(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case tea.KeyMsg:
+		switch msg.String() {
+		case "esc", "q":
+			m.view = viewList
+			m.prContent = ""
+			return m, nil
+		}
+	}
+	return m, nil
+}
+
+func (m sidebarModel) viewPR() string {
+	var sb strings.Builder
+	sb.WriteString(sectionStyle.Render("Pull Request Information") + "\n")
+	sb.WriteString(dimStyle.Render(strings.Repeat("─", m.width-1)) + "\n")
+	if m.prContent == "" {
+		sb.WriteString(dimStyle.Render("No information available.") + "\n")
+	} else {
+		sb.WriteString(m.prContent + "\n")
+	}
+	sb.WriteString("\n" + helpStyle.Render("esc  close"))
+	return sb.String()
 }
 
 func (m sidebarModel) updateList(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -332,6 +388,20 @@ func (m sidebarModel) updateList(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "enter", " ", "o":
 			if it := m.currentItem(); it != nil {
 				return m, m.doSwitch(*it)
+			}
+		case "P":
+			if it := m.currentItem(); it != nil && !it.isShell && it.worktree.PRInfo != "" {
+				path := it.worktree.Path
+				return m, openPRPopup(path)
+			}
+		case "C":
+			if it := m.currentItem(); it != nil && !it.isShell {
+				if it.worktree.PRInfo != "" {
+					m.inErr = "PR already exists: " + it.worktree.PRInfo
+					return m, nil
+				}
+				path := it.worktree.Path
+				return m, openCreatePRPopup(path)
 			}
 		case "n":
 			if it := m.currentItem(); it != nil && !it.isShell {
@@ -651,6 +721,8 @@ func (m sidebarModel) View() string {
 		return m.viewAddProject()
 	case viewConfirm:
 		return m.viewConfirm()
+	case viewPR:
+		return m.viewPR()
 	default:
 		return m.viewList()
 	}
@@ -706,22 +778,31 @@ func (m sidebarModel) viewList() string {
 		case hasWindow:
 			marker = " ◦"
 		}
-		branch := truncate(it.worktree.Branch, w-4-len(marker))
 
-		var line string
+		display := it.display
+		if display == "" {
+			display = friendlyWorktreeName(it.project, it.worktree)
+		}
+		title := truncate(display, w-4-len(marker))
+		titleLine := ""
 		switch {
 		case isCursor && isActive:
-			line = activeStyle.Render("▶ " + branch + marker)
+			titleLine = activeStyle.Render("▶ " + title + marker)
 		case isCursor:
-			line = activeStyle.Render("▶ " + branch + marker)
+			titleLine = activeStyle.Render("▶ " + title + marker)
 		case isActive:
-			line = normalStyle.Render("  " + branch + marker)
+			titleLine = normalStyle.Render("  " + title + marker)
 		case hasWindow:
-			line = normalStyle.Render("  " + branch + marker)
+			titleLine = normalStyle.Render("  " + title + marker)
 		default:
-			line = dimStyle.Render("  " + branch)
+			titleLine = dimStyle.Render("  " + title)
 		}
-		sb.WriteString(line + "\n")
+
+		sb.WriteString(titleLine + "\n")
+		if it.branch != "" {
+			sb.WriteString(formatBranchLine(it.branch, it.worktree.PRInfo, w) + "\n")
+		}
+		continue
 	}
 
 	if len(m.items) == 0 {
@@ -740,6 +821,8 @@ func (m sidebarModel) viewList() string {
 		helpStyle.Render("a  add project") + "\n" +
 		helpStyle.Render("D  rm worktree") + "\n" +
 		helpStyle.Render("d  rm project") + "\n" +
+		helpStyle.Render("P  PR details") + "\n" +
+		helpStyle.Render("C  create PR") + "\n" +
 		helpStyle.Render("r  refresh") + "\n" +
 		helpStyle.Render("q  quit") + "\n" +
 		div + "\n" +
@@ -789,12 +872,687 @@ func (m sidebarModel) viewAddProject() string {
 	return sb.String()
 }
 
+func friendlyWorktreeName(p Project, wt Worktree) string {
+	if wt.Path == p.Path {
+		return p.Name
+	}
+	name := filepath.Base(wt.Path)
+	prefix := p.Name + "-"
+	if strings.HasPrefix(name, prefix) {
+		return strings.TrimPrefix(name, prefix)
+	}
+	return name
+}
+
+func formatBranchLine(branch, prInfo string, width int) string {
+	leftWidth := width - 1
+	if leftWidth < 1 {
+		leftWidth = 1
+	}
+	prefix := "    "
+	if prInfo == "" {
+		return branchStyle.Render(truncate(prefix+branch, leftWidth))
+	}
+
+	right := prStyle.Render(prInfo)
+	rightWidth := lipgloss.Width(prInfo)
+	gapWidth := leftWidth - len(prefix) - rightWidth
+	if gapWidth < 1 {
+		gapWidth = 1
+	}
+	branchText := truncate(branch, gapWidth-1)
+	left := branchStyle.Render(prefix + branchText)
+	spaces := leftWidth - lipgloss.Width(prefix+branchText) - rightWidth
+	if spaces < 1 {
+		spaces = 1
+	}
+	return left + strings.Repeat(" ", spaces) + right
+}
+
+func openPRPopup(path string) tea.Cmd {
+	return func() tea.Msg {
+		bin, err := os.Executable()
+		if err != nil {
+			return prPopupDoneMsg{err: err}
+		}
+		cmd := exec.Command("tmux", "display-popup", "-t", "gw:active.1", "-w", "90%", "-h", "90%", "-E", bin, "--pr-details", path)
+		if err := cmd.Run(); err != nil {
+			return prPopupDoneMsg{err: err}
+		}
+		return prPopupDoneMsg{}
+	}
+}
+
+type prDetailsModel struct {
+	path     string
+	loading  bool
+	tab      int
+	width    int
+	height   int
+	info     string
+	diff     string
+	diffTool string
+	err      string
+	viewport viewport.Model
+}
+
+type prDetailsLoadedMsg struct {
+	info     string
+	diff     string
+	diffTool string
+	err      error
+}
+
+func runPRDetails(path string) {
+	p := tea.NewProgram(prDetailsModel{path: path, loading: true}, tea.WithAltScreen())
+	if _, err := p.Run(); err != nil {
+		fmt.Fprintln(os.Stderr, "gw pr:", err)
+	}
+}
+
+func (m prDetailsModel) Init() tea.Cmd { return loadPRDetails(m.path) }
+
+func (m prDetailsModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case tea.WindowSizeMsg:
+		m.width, m.height = msg.Width, msg.Height
+		m.viewport.Width = max(20, msg.Width-4)
+		m.viewport.Height = max(3, msg.Height-7)
+		m.viewport.SetContent(m.currentPRBody())
+	case tea.KeyMsg:
+		switch msg.String() {
+		case "ctrl+c", "esc", "q":
+			return m, tea.Quit
+		case "tab", "right", "l", "shift+tab", "left", "h":
+			m.tab = (m.tab + 1) % 2
+			m.viewport.GotoTop()
+			m.viewport.SetContent(m.currentPRBody())
+			return m, nil
+		}
+	case prDetailsLoadedMsg:
+		m.loading = false
+		if msg.err != nil {
+			m.err = msg.err.Error()
+		}
+		m.info = msg.info
+		m.diff = msg.diff
+		m.diffTool = msg.diffTool
+		m.viewport.SetContent(m.currentPRBody())
+	}
+	var cmd tea.Cmd
+	m.viewport, cmd = m.viewport.Update(msg)
+	return m, cmd
+}
+
+func (m prDetailsModel) View() string {
+	w := m.width
+	if w < 20 {
+		w = 100
+	}
+	return m.prHeader(w) + "\n" + m.viewport.View() + "\n" + m.prFooter(w)
+}
+
+func (m prDetailsModel) prHeader(w int) string {
+	tool := ""
+	if m.tab == 1 && m.diffTool != "" {
+		tool = dimStyle.Render("  diff: " + m.diffTool)
+	}
+	return lipgloss.NewStyle().Padding(0, 1).Render(sectionStyle.Render("Pull request")+tool) + "\n" +
+		lipgloss.NewStyle().Padding(0, 1).Render(m.tabLabel(0, "Conversation")+"  "+m.tabLabel(1, "Files changed")+dimStyle.Render("   tab/←/→ switch"))
+}
+
+func (m prDetailsModel) tabLabel(tab int, label string) string {
+	if m.tab == tab {
+		return lipgloss.NewStyle().Foreground(lipgloss.Color("15")).Background(lipgloss.Color("99")).Bold(true).Padding(0, 1).Render("● " + label)
+	}
+	return lipgloss.NewStyle().Foreground(lipgloss.Color("243")).Padding(0, 1).Render(label)
+}
+
+func (m prDetailsModel) prFooter(w int) string {
+	pos := fmt.Sprintf("%d%%", int(m.viewport.ScrollPercent()*100))
+	return helpStyle.Render("↑/↓ j/k pgup/pgdn scroll   tab switch tabs   q/esc close   " + pos)
+}
+
+func (m prDetailsModel) currentPRBody() string {
+	if m.err != "" {
+		return errStyle.Render(m.err)
+	}
+	if m.loading {
+		return "\n" + dimStyle.Render("Loading PR details…")
+	}
+	if m.tab == 0 {
+		return m.info
+	}
+	return sideBySideDiff(m.diff, m.viewport.Width)
+}
+
+func loadPRDetails(path string) tea.Cmd {
+	return func() tea.Msg {
+		info, err := prTextInfo(path)
+		if err != nil {
+			return prDetailsLoadedMsg{err: err}
+		}
+		diff, tool, err := prDiffText(path)
+		if err != nil {
+			return prDetailsLoadedMsg{info: info, err: err}
+		}
+		return prDetailsLoadedMsg{info: info, diff: diff, diffTool: tool}
+	}
+}
+
+func prTextInfo(path string) (string, error) {
+	type comment struct {
+		Author struct {
+			Login string `json:"login"`
+		} `json:"author"`
+		Body      string `json:"body"`
+		CreatedAt string `json:"createdAt"`
+	}
+	type prView struct {
+		Number                                   int `json:"number"`
+		Title, State, URL, Body, CreatedAt       string
+		BaseRefName, HeadRefName, ReviewDecision string
+		Author                                   struct {
+			Login string `json:"login"`
+		} `json:"author"`
+		Comments []comment `json:"comments"`
+	}
+	cmd := exec.Command("gh", "pr", "view", "--json", "number,title,state,url,author,body,comments,baseRefName,headRefName,createdAt,reviewDecision")
+	cmd.Dir = path
+	out, err := cmd.Output()
+	if err != nil {
+		return "", err
+	}
+	var pr prView
+	if err := json.Unmarshal(out, &pr); err != nil {
+		return "", err
+	}
+	var sb strings.Builder
+	sb.WriteString(activeStyle.Render(fmt.Sprintf("#%d %s", pr.Number, pr.Title)) + "\n")
+	sb.WriteString(dimStyle.Render(fmt.Sprintf("%s opened by @%s · %s → %s", pr.State, pr.Author.Login, pr.HeadRefName, pr.BaseRefName)) + "\n")
+	if pr.ReviewDecision != "" {
+		sb.WriteString(dimStyle.Render("review: ") + sectionStyle.Render(pr.ReviewDecision) + "\n")
+	}
+	sb.WriteString(dimStyle.Render(pr.URL) + "\n\n")
+
+	sb.WriteString(githubBox("Description", pr.Body))
+	if len(pr.Comments) > 0 {
+		sb.WriteString("\n" + sectionStyle.Render("Conversation") + "\n")
+	}
+	for _, c := range pr.Comments {
+		sb.WriteString("\n" + lipgloss.NewStyle().Bold(true).Render("@"+c.Author.Login) + dimStyle.Render(" commented "+c.CreatedAt) + "\n")
+		sb.WriteString(githubBox("", c.Body))
+	}
+	return sb.String(), nil
+}
+
+func prDiffText(path string) (string, string, error) {
+	gh := exec.Command("gh", "pr", "diff", "--color", "never")
+	gh.Dir = path
+	var ghErr bytes.Buffer
+	gh.Stderr = &ghErr
+	out, err := gh.Output()
+	if err != nil {
+		msg := strings.TrimSpace(ghErr.String())
+		if msg == "" {
+			msg = err.Error()
+		}
+		return "", "", fmt.Errorf("gh pr diff: %s", msg)
+	}
+	return string(out), "side-by-side", nil
+}
+
+func githubBox(title, body string) string {
+	const contentWidth = 96
+	body = strings.TrimSpace(body)
+	if body == "" {
+		body = "No description provided."
+	}
+	var sb strings.Builder
+	if title != "" {
+		sb.WriteString(sectionStyle.Render(title) + "\n")
+	}
+	for _, line := range wrapLines(body, contentWidth) {
+		sb.WriteString(line + "\n")
+	}
+	return sb.String()
+}
+
+func sideBySideDiff(diff string, width int) string {
+	if width < 40 {
+		width = 40
+	}
+	sepWidth := 3
+	leftWidth := (width - sepWidth) / 2
+	rightWidth := width - sepWidth - leftWidth
+
+	var sb strings.Builder
+	var pendingDeletes []string
+
+	flushDeletes := func() {
+		for _, d := range pendingDeletes {
+			writeDiffRow(&sb, "− "+d, "", leftWidth, rightWidth, errStyle, normalStyle)
+		}
+		pendingDeletes = nil
+	}
+
+	for _, l := range strings.Split(diff, "\n") {
+		switch {
+		case strings.HasPrefix(l, "diff --git"):
+			flushDeletes()
+			sb.WriteString("\n" + sectionStyle.Render(truncate(l, width)) + "\n")
+		case strings.HasPrefix(l, "@@"):
+			flushDeletes()
+			sb.WriteString(activeStyle.Render(truncate(l, width)) + "\n")
+		case strings.HasPrefix(l, "index ") || strings.HasPrefix(l, "---") || strings.HasPrefix(l, "+++"):
+			flushDeletes()
+			sb.WriteString(dimStyle.Render(truncate(l, width)) + "\n")
+		case strings.HasPrefix(l, "-"):
+			pendingDeletes = append(pendingDeletes, l[1:])
+		case strings.HasPrefix(l, "+"):
+			right := l[1:]
+			if len(pendingDeletes) > 0 {
+				left := pendingDeletes[0]
+				pendingDeletes = pendingDeletes[1:]
+				writeDiffRow(&sb, "− "+left, "+ "+right, leftWidth, rightWidth, errStyle, normalStyle)
+			} else {
+				writeDiffRow(&sb, "", "+ "+right, leftWidth, rightWidth, errStyle, normalStyle)
+			}
+		case strings.HasPrefix(l, " "):
+			flushDeletes()
+			text := "  " + l[1:]
+			writeDiffRow(&sb, text, text, leftWidth, rightWidth, lipgloss.NewStyle(), lipgloss.NewStyle())
+		case l == "":
+			flushDeletes()
+		default:
+			flushDeletes()
+			sb.WriteString(truncate(l, width) + "\n")
+		}
+	}
+	flushDeletes()
+	return sb.String()
+}
+
+func writeDiffRow(sb *strings.Builder, left, right string, leftWidth, rightWidth int, leftStyle, rightStyle lipgloss.Style) {
+	leftLines := wrapLines(left, leftWidth)
+	rightLines := wrapLines(right, rightWidth)
+	rows := len(leftLines)
+	if len(rightLines) > rows {
+		rows = len(rightLines)
+	}
+	if rows == 0 {
+		rows = 1
+	}
+	for i := 0; i < rows; i++ {
+		var l, r string
+		if i < len(leftLines) {
+			l = leftLines[i]
+		}
+		if i < len(rightLines) {
+			r = rightLines[i]
+		}
+		sb.WriteString(leftStyle.Render(padVisual(l, leftWidth)))
+		sb.WriteString(dimStyle.Render(" │ "))
+		sb.WriteString(rightStyle.Render(padVisual(r, rightWidth)))
+		sb.WriteString("\n")
+	}
+}
+
+func padVisual(s string, n int) string {
+	w := lipgloss.Width(s)
+	if w >= n {
+		return s
+	}
+	return s + strings.Repeat(" ", n-w)
+}
+
+func wrapLines(s string, width int) []string {
+	if width <= 0 {
+		return []string{s}
+	}
+	var out []string
+	for _, para := range strings.Split(s, "\n") {
+		if para == "" {
+			out = append(out, "")
+			continue
+		}
+		for runeLen(para) > width {
+			cut := wrapCut(para, width)
+			out = append(out, strings.TrimRight(para[:cut], " "))
+			para = strings.TrimLeft(para[cut:], " ")
+		}
+		out = append(out, para)
+	}
+	return out
+}
+
+func wrapCut(s string, width int) int {
+	lastSpace, count := -1, 0
+	for i, r := range s {
+		if r == ' ' || r == '\t' {
+			lastSpace = i
+		}
+		if count == width {
+			if lastSpace > 0 {
+				return lastSpace
+			}
+			return i
+		}
+		count++
+	}
+	return len(s)
+}
+
+func pad(s string, n int) string {
+	l := runeLen(s)
+	if l >= n {
+		return s
+	}
+	return s + strings.Repeat(" ", n-l)
+}
+
 func truncate(s string, max int) string {
-	if max <= 0 {
+	if max <= 0 || runeLen(s) <= max {
 		return s
 	}
-	if len(s) <= max {
-		return s
+	r := []rune(s)
+	return string(r[:max-1]) + "…"
+}
+
+func runeLen(s string) int { return len([]rune(s)) }
+
+func openCreatePRPopup(path string) tea.Cmd {
+	return func() tea.Msg {
+		bin, err := os.Executable()
+		if err != nil {
+			return prPopupDoneMsg{err: err}
+		}
+		cmd := exec.Command("tmux", "display-popup", "-t", "gw:active.1", "-w", "90%", "-h", "90%", "-E", bin, "--create-pr", path)
+		if err := cmd.Run(); err != nil {
+			return prPopupDoneMsg{err: err}
+		}
+		return prPopupDoneMsg{}
 	}
-	return s[:max-1] + "…"
+}
+
+type createPRDraft struct {
+	Base  string
+	Head  string
+	Title string
+	Body  string
+	Diff  string
+}
+
+type createPRModel struct {
+	path     string
+	loading  bool
+	creating bool
+	created  string
+	err      string
+	width    int
+	height   int
+	focus    int
+	draft    createPRDraft
+	title    textinput.Model
+	body     textarea.Model
+	preview  viewport.Model
+}
+
+type createPRLoadedMsg struct {
+	draft createPRDraft
+	err   error
+}
+
+type createPRCreatedMsg struct {
+	url string
+	err error
+}
+
+func runCreatePR(path string) {
+	ti := textinput.New()
+	ti.Placeholder = "PR title"
+	ta := textarea.New()
+	ta.Placeholder = "PR description"
+	ta.ShowLineNumbers = false
+	ta.CharLimit = 20000
+	m := createPRModel{path: path, loading: true, title: ti, body: ta}
+	p := tea.NewProgram(m, tea.WithAltScreen())
+	if _, err := p.Run(); err != nil {
+		fmt.Fprintln(os.Stderr, "gw create-pr:", err)
+	}
+}
+
+func (m createPRModel) Init() tea.Cmd { return loadCreatePRDraftCmd(m.path) }
+
+func (m createPRModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case tea.WindowSizeMsg:
+		m.width, m.height = msg.Width, msg.Height
+		m.preview.Width = max(20, msg.Width-4)
+		m.preview.Height = max(3, msg.Height-10)
+		m.body.SetWidth(max(20, msg.Width-4))
+		m.body.SetHeight(max(4, msg.Height-12))
+		m.preview.SetContent(m.previewText())
+	case createPRLoadedMsg:
+		m.loading = false
+		if msg.err != nil {
+			m.err = msg.err.Error()
+			return m, nil
+		}
+		m.draft = msg.draft
+		m.title.SetValue(msg.draft.Title)
+		m.body.SetValue(msg.draft.Body)
+		m.title.Focus()
+		m.preview.SetContent(m.previewText())
+		return m, textinput.Blink
+	case createPRCreatedMsg:
+		m.creating = false
+		if msg.err != nil {
+			m.err = msg.err.Error()
+			return m, nil
+		}
+		m.created = msg.url
+		return m, nil
+	case tea.KeyMsg:
+		if m.created != "" {
+			switch msg.String() {
+			case "ctrl+c", "esc", "q", "enter":
+				return m, tea.Quit
+			}
+			return m, nil
+		}
+		switch msg.String() {
+		case "ctrl+c", "esc":
+			return m, tea.Quit
+		case "tab", "shift+tab":
+			if msg.String() == "shift+tab" {
+				m.focus = (m.focus + 2) % 3
+			} else {
+				m.focus = (m.focus + 1) % 3
+			}
+			m.title.Blur()
+			m.body.Blur()
+			if m.focus == 0 {
+				m.title.Focus()
+			} else if m.focus == 1 {
+				m.body.Focus()
+			}
+			m.preview.SetContent(m.previewText())
+			return m, nil
+		case "ctrl+s":
+			if m.loading || m.creating {
+				return m, nil
+			}
+			title := strings.TrimSpace(m.title.Value())
+			body := strings.TrimSpace(m.body.Value())
+			if title == "" {
+				m.err = "title cannot be empty"
+				return m, nil
+			}
+			m.creating = true
+			return m, createPRCmd(m.path, m.draft.Base, m.draft.Head, title, body)
+		}
+	}
+
+	var cmd tea.Cmd
+	switch m.focus {
+	case 0:
+		m.title, cmd = m.title.Update(msg)
+	case 1:
+		m.body, cmd = m.body.Update(msg)
+	case 2:
+		m.preview, cmd = m.preview.Update(msg)
+	}
+	m.preview.SetContent(m.previewText())
+	return m, cmd
+}
+
+func (m createPRModel) View() string {
+	if m.created != "" {
+		return "\n" + sectionStyle.Render("Pull request created") + "\n\n" + normalStyle.Render(m.created) + "\n\n" + helpStyle.Render("enter / q / esc  close")
+	}
+	if m.loading {
+		return "\n" + dimStyle.Render("Preparing pull request draft…")
+	}
+	if m.err != "" && m.draft.Title == "" {
+		return "\n" + errStyle.Render(m.err) + "\n\n" + helpStyle.Render("esc  close")
+	}
+
+	var sb strings.Builder
+	sb.WriteString(sectionStyle.Render("Create pull request") + "\n")
+	sb.WriteString(dimStyle.Render(fmt.Sprintf("%s → %s", m.draft.Head, m.draft.Base)) + "\n\n")
+	sb.WriteString(focusLabel(m.focus == 0, "Title") + "\n")
+	sb.WriteString(m.title.View() + "\n\n")
+	sb.WriteString(focusLabel(m.focus == 1, "Body") + "\n")
+	if m.focus == 2 {
+		sb.WriteString(dimStyle.Render("(tab back to edit body)") + "\n")
+	} else {
+		sb.WriteString(m.body.View() + "\n")
+	}
+	if m.focus == 2 {
+		sb.WriteString("\n" + focusLabel(true, "Diff vs base") + "\n" + m.preview.View() + "\n")
+	}
+	if m.err != "" {
+		sb.WriteString("\n" + errStyle.Render(m.err) + "\n")
+	}
+	if m.creating {
+		sb.WriteString("\n" + dimStyle.Render("Creating PR…") + "\n")
+	}
+	sb.WriteString("\n" + helpStyle.Render("tab  switch fields   ctrl+s  create PR   esc  cancel"))
+	return sb.String()
+}
+
+func focusLabel(active bool, label string) string {
+	if active {
+		return activeStyle.Render("● " + label)
+	}
+	return dimStyle.Render("  " + label)
+}
+
+func (m createPRModel) previewText() string {
+	return sectionStyle.Render("Diff stat") + "\n" + m.draft.Diff
+}
+
+func loadCreatePRDraftCmd(path string) tea.Cmd {
+	return func() tea.Msg {
+		draft, err := createPRDraftForPath(path)
+		return createPRLoadedMsg{draft: draft, err: err}
+	}
+}
+
+func createPRDraftForPath(path string) (createPRDraft, error) {
+	if _, err := exec.LookPath("gh"); err != nil {
+		return createPRDraft{}, fmt.Errorf("gh CLI is required to create pull requests")
+	}
+	branch, err := gitOutput(path, "rev-parse", "--abbrev-ref", "HEAD")
+	if err != nil || branch == "HEAD" {
+		return createPRDraft{}, fmt.Errorf("current worktree is not on a branch")
+	}
+	upstream, err := gitOutput(path, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}")
+	if err != nil || upstream == "" {
+		return createPRDraft{}, fmt.Errorf("branch is not pushed yet (set upstream first)")
+	}
+	parts := strings.SplitN(upstream, "/", 2)
+	if len(parts) != 2 {
+		return createPRDraft{}, fmt.Errorf("cannot determine upstream remote for %s", upstream)
+	}
+	remoteURL, _ := gitOutput(path, "config", "--get", "remote."+parts[0]+".url")
+	if !strings.Contains(remoteURL, "github.com") {
+		return createPRDraft{}, fmt.Errorf("upstream remote is not GitHub: %s", parts[0])
+	}
+	counts, err := gitOutput(path, "rev-list", "--left-right", "--count", "@{u}...HEAD")
+	if err != nil {
+		return createPRDraft{}, err
+	}
+	fields := strings.Fields(counts)
+	if len(fields) == 2 && fields[1] != "0" {
+		return createPRDraft{}, fmt.Errorf("branch has unpushed commits; push first")
+	}
+	viewCmd := exec.Command("gh", "pr", "view", "--json", "number")
+	viewCmd.Dir = path
+	if viewCmd.Run() == nil {
+		return createPRDraft{}, fmt.Errorf("this branch already has a pull request")
+	}
+	base := configuredBase(path, branch)
+	baseRef := base
+	if gitOutputOK(path, "rev-parse", "--verify", "refs/remotes/"+parts[0]+"/"+base) {
+		baseRef = parts[0] + "/" + base
+	}
+	log, err := gitOutput(path, "log", "--reverse", "--pretty=format:- %s", baseRef+"...HEAD")
+	if err != nil || strings.TrimSpace(log) == "" {
+		return createPRDraft{}, fmt.Errorf("no commits found versus %s", base)
+	}
+	title, _ := gitOutput(path, "log", "-1", "--pretty=%s")
+	diff, _ := gitOutput(path, "diff", "--stat", baseRef+"...HEAD")
+	body := "## Summary\n" + log + "\n\n## Diff\n```\n" + strings.TrimSpace(diff) + "\n```\n"
+	return createPRDraft{Base: base, Head: branch, Title: title, Body: body, Diff: diff}, nil
+}
+
+func configuredBase(path, branch string) string {
+	if base, err := gitOutput(path, "config", "--get", "branch."+branch+".gh-merge-base"); err == nil && base != "" {
+		return base
+	}
+	cmd := exec.Command("gh", "repo", "view", "--json", "defaultBranchRef", "--jq", ".defaultBranchRef.name")
+	cmd.Dir = path
+	if out, err := cmd.Output(); err == nil && strings.TrimSpace(string(out)) != "" {
+		return strings.TrimSpace(string(out))
+	}
+	if base, err := gitOutput(path, "symbolic-ref", "--short", "refs/remotes/origin/HEAD"); err == nil && strings.Contains(base, "/") {
+		return strings.TrimPrefix(base, "origin/")
+	}
+	return "main"
+}
+
+func createPRCmd(path, base, head, title, body string) tea.Cmd {
+	return func() tea.Msg {
+		f, err := os.CreateTemp("", "gw-pr-body-*.md")
+		if err != nil {
+			return createPRCreatedMsg{err: err}
+		}
+		name := f.Name()
+		defer os.Remove(name)
+		if _, err := f.WriteString(body); err != nil {
+			f.Close()
+			return createPRCreatedMsg{err: err}
+		}
+		f.Close()
+		cmd := exec.Command("gh", "pr", "create", "--base", base, "--head", head, "--title", title, "--body-file", name)
+		cmd.Dir = path
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			return createPRCreatedMsg{err: fmt.Errorf("%s", strings.TrimSpace(string(out)))}
+		}
+		return createPRCreatedMsg{url: strings.TrimSpace(string(out))}
+	}
+}
+
+func gitOutput(path string, args ...string) (string, error) {
+	cmd := exec.Command("git", append([]string{"-C", path}, args...)...)
+	out, err := cmd.Output()
+	return strings.TrimSpace(string(out)), err
+}
+
+func gitOutputOK(path string, args ...string) bool {
+	cmd := exec.Command("git", append([]string{"-C", path}, args...)...)
+	return cmd.Run() == nil
 }

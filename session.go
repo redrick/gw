@@ -18,11 +18,11 @@ type Project struct {
 }
 
 type State struct {
-	Projects         []Project         `json:"projects"`
-	ActiveTitle      string            `json:"active_title,omitempty"`
-	ActiveSub        map[string]string `json:"active_sub,omitempty"`
-	LaunchDir        string            `json:"launch_dir,omitempty"`
-	LaunchedFromShell bool             `json:"launched_from_shell,omitempty"`
+	Projects          []Project         `json:"projects"`
+	ActiveTitle       string            `json:"active_title,omitempty"`
+	ActiveSub         map[string]string `json:"active_sub,omitempty"`
+	LaunchDir         string            `json:"launch_dir,omitempty"`
+	LaunchedFromShell bool              `json:"launched_from_shell,omitempty"`
 }
 
 func statePath() string {
@@ -207,6 +207,18 @@ func switchToWindow(fromTitle, toTitle, toPath string, st State) {
 type Worktree struct {
 	Path   string
 	Branch string
+	PRInfo string
+}
+
+func getPRInfo(path string) string {
+	// Use gh to find if there's an open PR for the current branch.
+	cmd := exec.Command("gh", "pr", "view", "--json", "number", "--template", `#{{.number}}`)
+	cmd.Dir = path
+	out, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
 }
 
 func listWorktrees(repoPath string) ([]Worktree, error) {
@@ -233,6 +245,7 @@ func listWorktrees(repoPath string) ([]Worktree, error) {
 				if cur.Branch == "" {
 					cur.Branch = "(unknown)"
 				}
+				cur.PRInfo = getPRInfo(cur.Path)
 				trees = append(trees, cur)
 				cur = Worktree{}
 			}
@@ -242,6 +255,7 @@ func listWorktrees(repoPath string) ([]Worktree, error) {
 		if cur.Branch == "" {
 			cur.Branch = "(unknown)"
 		}
+		cur.PRInfo = getPRInfo(cur.Path)
 		trees = append(trees, cur)
 	}
 	return trees, sc.Err()

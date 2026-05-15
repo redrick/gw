@@ -24,6 +24,16 @@ func main() {
 		case "--prev-subwindow":
 			runPrevSubwindow()
 			return
+		case "--pr-details":
+			if len(os.Args) > 2 {
+				runPRDetails(os.Args[2])
+			}
+			return
+		case "--create-pr":
+			if len(os.Args) > 2 {
+				runCreatePR(os.Args[2])
+			}
+			return
 		}
 	}
 	launch()
