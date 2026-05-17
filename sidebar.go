@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/textinput"
@@ -28,6 +29,30 @@ var (
 	helpStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
 	errStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
 )
+
+// ── Dog animation ─────────────────────────────────────────────────────────────
+
+type dogTickMsg struct{}
+
+var dogIdleFrames = [2]string{
+	"    / \\__\n   (    @\\___\n   /         o\n  /   (_____/\n /_____/   U",
+	"    / \\__\n   (    @\\___\n   /         O\n  /   (_____/\n /_____/   U",
+}
+
+var dogActiveFrames = [4]string{
+	"    / \\__\n   (    @\\___\n   /         O\n  /   (_____/\n /_____/  ~U",
+	"    / \\__\n   (    @\\___\n   /        ~O\n  /   (_____/\n /_____/  ~U",
+	"    / \\__\n   (    @\\___\n   /         O\n  /   (_____/\n /_____/   U",
+	"    / \\__\n   (    @\\___\n   /        ~O\n  /   (_____/\n /_____/   U",
+}
+
+const dogBarkFrame = "    / \\__\n   (    @\\___\n   /         O  Woof!\n  /   (_____/\n /_____/   U"
+
+const dogLookFrame = "    / \\__\n   (    @\\___\n   /    O\n  /   (_____/\n /_____/   U"
+
+func dogTickCmd(d time.Duration) tea.Cmd {
+	return tea.Tick(d, func(time.Time) tea.Msg { return dogTickMsg{} })
+}
 
 // ── List items ────────────────────────────────────────────────────────────────
 
@@ -134,6 +159,14 @@ type sidebarModel struct {
 	pending     pendingKind
 	pendingItem listItem
 	prContent   string
+	dogFrame    int
+	dogLastKey  time.Time
+	dogLastBark time.Time
+	dogBarking  bool
+	dogBarkEnd  time.Time
+	dogLooking  bool
+	dogLookEnd  time.Time
+	dogNextLook time.Time
 }
 
 func newSidebarModel() sidebarModel {
@@ -168,7 +201,8 @@ func newSidebarModel() sidebarModel {
 		}
 	}
 
-	return sidebarModel{items: items, cursor: cursor, input: ti, state: st, windows: liveWindows()}
+	now := time.Now()
+	return sidebarModel{items: items, cursor: cursor, input: ti, state: st, windows: liveWindows(), dogLastKey: now, dogLastBark: now, dogNextLook: now.Add(5 * time.Second)}
 }
 
 func runSidebar() {
@@ -225,10 +259,49 @@ func (m *sidebarModel) refresh() {
 
 // ── bubbletea ─────────────────────────────────────────────────────────────────
 
-func (m sidebarModel) Init() tea.Cmd { return nil }
+func (m sidebarModel) Init() tea.Cmd { return dogTickCmd(800 * time.Millisecond) }
 
 func (m sidebarModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	if _, ok := msg.(tea.KeyMsg); ok {
+		wasActive := time.Since(m.dogLastKey) < 3*time.Second
+		m.dogLastKey = time.Now()
+		if !wasActive {
+			m.dogNextLook = time.Now().Add(5 * time.Second)
+		}
+	}
+
 	switch msg := msg.(type) {
+	case dogTickMsg:
+		now := time.Now()
+		if m.dogBarking {
+			if now.After(m.dogBarkEnd) {
+				m.dogBarking = false
+				m.dogLastBark = now
+			}
+			return m, dogTickCmd(100 * time.Millisecond)
+		}
+		active := now.Sub(m.dogLastKey) < 3*time.Second
+		if !active && now.Sub(m.dogLastKey) >= 30*time.Second && now.Sub(m.dogLastBark) >= 30*time.Second {
+			m.dogBarking = true
+			m.dogBarkEnd = now.Add(700 * time.Millisecond)
+			return m, dogTickCmd(100 * time.Millisecond)
+		}
+		if active {
+			if m.dogLooking {
+				if now.After(m.dogLookEnd) {
+					m.dogLooking = false
+					m.dogNextLook = now.Add(time.Duration(3+int(now.UnixNano()/1e9%5)) * time.Second)
+				}
+			} else if now.After(m.dogNextLook) {
+				m.dogLooking = true
+				m.dogLookEnd = now.Add(700 * time.Millisecond)
+			}
+			m.dogFrame = (m.dogFrame + 1) % len(dogActiveFrames)
+			return m, dogTickCmd(150 * time.Millisecond)
+		}
+		m.dogLooking = false
+		m.dogFrame = (m.dogFrame + 1) % len(dogIdleFrames)
+		return m, dogTickCmd(800 * time.Millisecond)
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
@@ -728,6 +801,46 @@ func (m sidebarModel) View() string {
 	}
 }
 
+func (m sidebarModel) dogView() string {
+	var frame string
+	if m.dogBarking {
+		frame = dogBarkFrame
+	} else if m.dogLooking {
+		frame = dogLookFrame
+	} else if time.Since(m.dogLastKey) < 3*time.Second {
+		frame = dogActiveFrames[m.dogFrame%len(dogActiveFrames)]
+	} else {
+		frame = dogIdleFrames[m.dogFrame%len(dogIdleFrames)]
+	}
+	return dimStyle.Render(centerDogArt(frame, m.width))
+}
+
+func centerDogArt(art string, width int) string {
+	if width <= 0 {
+		return art
+	}
+	lines := strings.Split(art, "\n")
+	maxW := 0
+	for _, l := range lines {
+		if lw := runeLen(l); lw > maxW {
+			maxW = lw
+		}
+	}
+	pad := (width - maxW) / 2
+	if pad <= 0 {
+		return art
+	}
+	prefix := strings.Repeat(" ", pad)
+	var sb strings.Builder
+	for i, l := range lines {
+		if i > 0 {
+			sb.WriteByte('\n')
+		}
+		sb.WriteString(prefix + l)
+	}
+	return sb.String()
+}
+
 func (m sidebarModel) viewList() string {
 	w := m.width
 	if w < 10 {
@@ -735,6 +848,8 @@ func (m sidebarModel) viewList() string {
 	}
 
 	var sb strings.Builder
+	sb.WriteString(m.dogView() + "\n")
+	sb.WriteString(dimStyle.Render(strings.Repeat("─", w-1)) + "\n")
 	sb.WriteString(sectionStyle.Render("worktrees") + "\n")
 	sb.WriteString(dimStyle.Render(strings.Repeat("─", w-1)) + "\n")
 	if m.inErr != "" {
