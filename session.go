@@ -116,7 +116,7 @@ func ensureStorageWindow(winName, path string) {
 	if path != "" {
 		args = append(args, "-c", path)
 	}
-	args = append(args, shellBin())
+	args = append(args, shellBin(), "-l")
 	exec.Command("tmux", args...).Run()
 	exec.Command("tmux", "set-option", "-t", "gw:"+winName, "automatic-rename", "off").Run()
 	exec.Command("tmux", "set-option", "-t", "gw:"+winName, "allow-rename", "off").Run()
@@ -308,7 +308,7 @@ func createSubWindow(baseTitle, path string) (string, error) {
 	if path != "" {
 		args = append(args, "-c", path)
 	}
-	args = append(args, shellBin())
+	args = append(args, shellBin(), "-l")
 	if err := exec.Command("tmux", args...).Run(); err != nil {
 		return "", err
 	}

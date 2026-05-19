@@ -82,7 +82,7 @@ func setupTmuxSession() {
 	}
 
 	sh := shellBin()
-	exec.Command("tmux", "split-window", "-t", "gw:active.0", "-h", sh).Run()
+	exec.Command("tmux", "split-window", "-t", "gw:active.0", "-h", sh, "-l").Run()
 
 	// Keep pane 1 alive even after shell exits (e.g., ^D).
 	exec.Command("tmux", "set-option", "-t", "gw:active.1", "remain-on-exit", "on").Run()
