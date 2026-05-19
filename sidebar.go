@@ -1275,6 +1275,9 @@ func (m prDetailsModel) currentPRBody() string {
 	if m.tab == 0 {
 		return renderPRConversation(m.pr, m.selected)
 	}
+	if m.diffTool == "difftastic" {
+		return postProcessDifftastic(m.diff, m.viewport.Width)
+	}
 	return sideBySideDiff(m.diff, m.viewport.Width)
 }
 
@@ -1284,7 +1287,7 @@ func loadPRDetails(path string) tea.Cmd {
 		if err != nil {
 			return prDetailsLoadedMsg{err: err}
 		}
-		diff, tool, err := prDiffText(path)
+		diff, tool, err := prDiffText(path, pr.BaseRefName, pr.HeadRefName)
 		if err != nil {
 			return prDetailsLoadedMsg{pr: pr, err: err}
 		}
@@ -1372,7 +1375,16 @@ func ghGraphQL(path, query string, fields map[string]string) error {
 	return nil
 }
 
-func prDiffText(path string) (string, string, error) {
+func prDiffText(path, baseRef, headRef string) (string, string, error) {
+	if difft, err := exec.LookPath("difft"); err == nil {
+		cmd := exec.Command("git", "--no-pager", "diff", "origin/"+baseRef+"...origin/"+headRef)
+		cmd.Dir = path
+		cmd.Env = append(os.Environ(), "GIT_EXTERNAL_DIFF="+difft, "DFT_COLOR=always")
+		out, err := cmd.Output()
+		if err == nil {
+			return string(out), "difftastic", nil
+		}
+	}
 	gh := exec.Command("gh", "pr", "diff", "--color", "never")
 	gh.Dir = path
 	var ghErr bytes.Buffer
@@ -1415,6 +1427,58 @@ func githubBox(title, body string) string {
 	for _, line := range wrapLines(body, contentWidth) {
 		sb.WriteString(line + "\n")
 	}
+	return sb.String()
+}
+
+func stripANSI(s string) string {
+	var b []byte
+	inSeq := false
+	for i := 0; i < len(s); i++ {
+		if inSeq {
+			if (s[i] >= 'A' && s[i] <= 'Z') || (s[i] >= 'a' && s[i] <= 'z') {
+				inSeq = false
+			}
+			continue
+		}
+		if s[i] == '\033' && i+1 < len(s) && s[i+1] == '[' {
+			inSeq = true
+			i++
+			continue
+		}
+		b = append(b, s[i])
+	}
+	return string(b)
+}
+
+func looksLikeDifftasticHeader(plain string) bool {
+	idx := strings.Index(plain, " --- ")
+	if idx < 0 {
+		return false
+	}
+	left := strings.TrimSpace(plain[:idx])
+	right := strings.TrimSpace(plain[idx+5:])
+	return len(left) > 0 && len(right) > 0
+}
+
+func postProcessDifftastic(diff string, width int) string {
+	if width < 20 {
+		width = 96
+	}
+	divider := "\n" + dimStyle.Render(strings.Repeat("─", width)) + "\n"
+
+	lines := strings.Split(diff, "\n")
+	for len(lines) > 0 && strings.TrimSpace(stripANSI(lines[len(lines)-1])) == "" {
+		lines = lines[:len(lines)-1]
+	}
+
+	var sb strings.Builder
+	for i, line := range lines {
+		if looksLikeDifftasticHeader(stripANSI(line)) && i > 0 {
+			sb.WriteString(divider)
+		}
+		sb.WriteString(line + "\n")
+	}
+	sb.WriteString(divider)
 	return sb.String()
 }
 
