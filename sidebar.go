@@ -780,6 +780,7 @@ func (m sidebarModel) doSwitch(it listItem) tea.Cmd {
 		switchToWindow(from, title, path, st)
 		st.ActiveTitle = title
 		saveState(st)
+		updatePreviewTarget(from, st)
 		return switchedMsg{title: title}
 	}
 }
@@ -946,6 +947,7 @@ func (m sidebarModel) viewList() string {
 		helpStyle.Render("^a n  next") + "\n" +
 		helpStyle.Render("^a p  prev") + "\n" +
 		helpStyle.Render("^a s  sidebar") + "\n" +
+		helpStyle.Render("^a b  attach preview") + "\n" +
 		helpStyle.Render("^a [  scroll mode")
 
 	contentLines := strings.Count(content, "\n")

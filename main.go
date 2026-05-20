@@ -27,6 +27,9 @@ func main() {
 		case "--handle-pane-dead":
 			runHandlePaneDead()
 			return
+		case "--pin-preview":
+			runPinPreview()
+			return
 		case "--pr-details":
 			if len(os.Args) > 2 {
 				runPRDetails(os.Args[2])
@@ -128,6 +131,7 @@ func setupTmuxSession() {
 	exec.Command("tmux", "bind-key", "n", "run-shell", bin+" --next-subwindow").Run()
 	exec.Command("tmux", "bind-key", "p", "run-shell", bin+" --prev-subwindow").Run()
 	exec.Command("tmux", "bind-key", "s", "select-pane", "-t", "gw:active.0").Run()
+	exec.Command("tmux", "bind-key", "b", "run-shell", bin+" --pin-preview").Run()
 
 	cmd := exec.Command("tmux", "attach-session", "-t", "gw")
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
@@ -254,6 +258,7 @@ func runNavigateSubwindow(dir int) {
 	exec.Command("tmux", "swap-pane",
 		"-s", "gw:active.1",
 		"-t", "gw:"+currentSub+".0").Run()
+	resizeWindowToActive(nextSub)
 	exec.Command("tmux", "swap-pane",
 		"-s", "gw:active.1",
 		"-t", "gw:"+nextSub+".0").Run()

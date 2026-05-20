@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 )
 
@@ -23,6 +24,7 @@ type State struct {
 	ActiveSub         map[string]string `json:"active_sub,omitempty"`
 	LaunchDir         string            `json:"launch_dir,omitempty"`
 	LaunchedFromShell bool              `json:"launched_from_shell,omitempty"`
+	PinnedPreview     string            `json:"pinned_preview,omitempty"`
 }
 
 func statePath() string {
@@ -74,6 +76,261 @@ func (st *State) RemoveProject(path string) {
 // Each worktree gets a hidden tmux window ("storage window") that holds its
 // live pane. The visible right slot is gw:active.1. Switching is a server-side
 // swap-pane — nothing is typed into the pane's process.
+
+// previewReady is set to true once the preview column (capture pane + monitor)
+// has been created. It is never torn down during a session.
+var previewReady bool
+
+// monitorScript is a self-contained Python script that renders CPU/RAM
+// sparklines and all temperature sensors into the narrow (25-col) side pane.
+const monitorScript = `import sys, time, json, subprocess
+
+SPARK = " ▁▂▃▄▅▆▇█"
+
+def spark(h, w=10):
+    s = [SPARK[min(8, max(0, int(v / 100 * 8)))] for v in h[-w:]]
+    return " " * (w - len(s)) + "".join(s)
+
+def read_cpu():
+    f = open("/proc/stat").readline().split()
+    idle = int(f[4]) + int(f[5])
+    total = sum(int(x) for x in f[1:8])
+    return idle, total
+
+def read_mem():
+    d = {}
+    for line in open("/proc/meminfo"):
+        if ":" in line:
+            k, _, v = line.partition(":")
+            d[k.strip()] = int(v.split()[0])
+    used = (d["MemTotal"] - d["MemAvailable"]) // 1024
+    return used, d["MemTotal"] // 1024
+
+def read_temps():
+    try:
+        out = subprocess.check_output(["sensors", "-j"], stderr=subprocess.DEVNULL)
+        data = json.loads(out)
+    except Exception:
+        return []
+    results = []
+    for chip, sensors in data.items():
+        cname = chip.rsplit("-", 2)[0]
+        for sname, vals in sensors.items():
+            if not isinstance(vals, dict):
+                continue
+            for k, v in vals.items():
+                if k.endswith("_input") and k.startswith("temp") and isinstance(v, (int, float)) and v > 0:
+                    results.append((cname, sname, v))
+                    break
+    return results
+
+sys.stdout.write("\033[?7l")
+sys.stdout.flush()
+
+pi, pt = read_cpu()
+ch, rh = [], []
+
+while True:
+    ci, ct = read_cpu()
+    di, dt = ci - pi, ct - pt
+    cp = 100.0 * (1 - di / dt) if dt > 0 else 0.0
+    pi, pt = ci, ct
+    ch.append(cp)
+    ch = ch[-20:]
+
+    um, tm = read_mem()
+    rp = 100.0 * um / tm if tm else 0.0
+    rh.append(rp)
+    rh = rh[-20:]
+    ug, tg = um / 1024, tm / 1024
+
+    lines = [
+        f"CPU {spark(ch)} {cp:4.1f}%",
+        f"RAM {spark(rh)} {ug:.1f}/{tg:.0f}G",
+        "─" * 20,
+    ]
+    for cname, sname, temp in read_temps():
+        lines.append(f"{cname}/{sname}: {temp:.0f}°C")
+
+    sys.stdout.write("\033[H")
+    for line in lines:
+        sys.stdout.write(line[:25] + "\n")
+    sys.stdout.write("\033[J")
+    sys.stdout.flush()
+    time.sleep(1)
+`
+
+func monitorScriptPath() string {
+	dir, _ := os.UserConfigDir()
+	return filepath.Join(dir, "gw", "monitor.py")
+}
+
+func writeMonitorScript() string {
+	p := monitorScriptPath()
+	os.MkdirAll(filepath.Dir(p), 0755)
+	os.WriteFile(p, []byte(monitorScript), 0644)
+	return p
+}
+
+// windowsListScript renders all open tmux worktree windows grouped by project.
+// Each sub-window shows a colour-coded status with no program names:
+//   green  ● idle   — shell is in the foreground
+//   yellow ⠋ …      — a program is running (animated braille spinner)
+//   red    ✕ error  — pane is dead / unusable
+const windowsListScript = `import subprocess, sys, time, json, os
+
+SHELLS = {'bash', 'zsh', 'fish', 'sh', 'dash', 'tcsh'}
+W = 24
+RST = '\033[0m'
+SPIN = '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
+
+def c(code, text):
+    return f'\033[{code}m{text}{RST}'
+
+def run(*args):
+    try:
+        return subprocess.check_output(list(args), stderr=subprocess.DEVNULL).decode().strip()
+    except Exception:
+        return ''
+
+def load_projects():
+    try:
+        p = os.path.expanduser('~/.config/gw/state.json')
+        with open(p) as f:
+            return [pr['name'] for pr in json.load(f).get('projects', [])]
+    except Exception:
+        return []
+
+sys.stdout.write('\033[?7l')
+sys.stdout.flush()
+
+tick = 0
+
+while True:
+    projects = load_projects()
+    raw = run('tmux', 'list-windows', '-t', 'gw', '-F', '#{window_name}').splitlines()
+
+    buckets = {}
+    bucket_order = []
+    for w in raw:
+        w = w.strip()
+        if not w.startswith('wt-'):
+            continue
+        base = w.split('~')[0]
+        rest = base[3:]
+        proj = next((p for p in projects if rest == p or rest.startswith(p + '-')), rest.split('-')[0])
+        if proj not in buckets:
+            buckets[proj] = {}
+            bucket_order.append(proj)
+        if base not in buckets[proj]:
+            buckets[proj][base] = []
+        buckets[proj][base].append(w)
+
+    out = []
+    any_running = False
+
+    for proj in bucket_order:
+        out.append(c('38;5;99;1', proj[:W]))
+        for base, subs in buckets[proj].items():
+            rest = base[3:]
+            branch = rest[len(proj)+1:] if rest.startswith(proj + '-') else rest
+            out.append(c('38;5;243', (' ' + branch)[:W]))
+            for sub in subs:
+                idx = sub.split('~')[1] if '~' in sub else '1'
+                dead = run('tmux', 'display-message', '-t', 'gw:' + sub + '.0', '-p', '#{pane_dead}')
+                if dead == '1':
+                    indicator = c('38;5;196', '✕ error')
+                else:
+                    cmd = run('tmux', 'display-message', '-t', 'gw:' + sub + '.0', '-p', '#{pane_current_command}')
+                    if cmd in SHELLS or not cmd:
+                        indicator = c('38;5;82', '● idle')
+                    else:
+                        any_running = True
+                        indicator = c('38;5;226', SPIN[tick % len(SPIN)] + ' running')
+                out.append('  ' + idx + ' ' + indicator)
+
+    sys.stdout.write('\033[H')
+    for l in out:
+        sys.stdout.write(l + '\n')
+    sys.stdout.write('\033[J')
+    sys.stdout.flush()
+
+    tick += 1
+    time.sleep(0.15 if any_running else 1.0)
+`
+
+func windowsListScriptPath() string {
+	dir, _ := os.UserConfigDir()
+	return filepath.Join(dir, "gw", "windows-list.py")
+}
+
+func writeWindowsListScript() string {
+	p := windowsListScriptPath()
+	os.MkdirAll(filepath.Dir(p), 0755)
+	os.WriteFile(p, []byte(windowsListScript), 0644)
+	return p
+}
+
+// previewColumnExists checks whether the preview column is already present in
+// gw:active by counting panes. Sidebar + main + at least one preview pane = 3.
+func previewColumnExists() bool {
+	out, err := exec.Command("tmux", "list-panes", "-t", "gw:active", "-F", "x").Output()
+	if err != nil {
+		return false
+	}
+	return len(strings.Fields(string(out))) >= 3
+}
+
+// ensurePreviewColumn creates the right-side column exactly once: a windows
+// activity list at the top (2/3) and a system monitor at the bottom (1/3).
+func ensurePreviewColumn() {
+	if previewReady {
+		return
+	}
+	if previewColumnExists() {
+		previewReady = true
+		return
+	}
+
+	out, err := exec.Command("tmux", "split-window",
+		"-h", "-t", "gw:active.1", "-l", "25", "-d",
+		"-P", "-F", "#{pane_id}").Output()
+	if err != nil {
+		return
+	}
+	monitorID := strings.TrimSpace(string(out))
+
+	hOut, _ := exec.Command("tmux", "display-message", "-t", monitorID, "-p", "#{pane_height}").Output()
+	totalH, _ := strconv.Atoi(strings.TrimSpace(string(hOut)))
+	listH := totalH * 2 / 3
+	if listH < 6 {
+		listH = 6
+	}
+
+	out, err = exec.Command("tmux", "split-window",
+		"-v", "-t", monitorID, "-l", strconv.Itoa(listH), "-b", "-d",
+		"-P", "-F", "#{pane_id}").Output()
+	if err != nil {
+		exec.Command("tmux", "kill-pane", "-t", monitorID).Run()
+		return
+	}
+	listID := strings.TrimSpace(string(out))
+
+	listScript := writeWindowsListScript()
+	exec.Command("tmux", "send-keys", "-t", listID, "python3 "+listScript, "Enter").Run()
+	monitorScript := writeMonitorScript()
+	exec.Command("tmux", "send-keys", "-t", monitorID, "python3 "+monitorScript, "Enter").Run()
+
+	previewReady = true
+}
+
+// updatePreviewTarget ensures the preview column is created. Called on every
+// worktree switch; the windows list script refreshes itself automatically.
+func updatePreviewTarget(prevTitle string, st State) {
+	ensurePreviewColumn()
+}
+
+func runPinPreview() {}
 
 func shellBin() string {
 	if s := os.Getenv("SHELL"); s != "" {
@@ -137,6 +394,26 @@ func liveWindows() map[string]bool {
 	return m
 }
 
+// resizeWindowToActive pre-resizes a storage window to match gw:active.1's
+// current dimensions so that swapping the pane in causes no terminal resize
+// and therefore no SIGWINCH to the running process.
+func resizeWindowToActive(winName string) {
+	w, err := exec.Command("tmux", "display-message", "-t", "gw:active.1", "-p", "#{pane_width}").Output()
+	if err != nil {
+		return
+	}
+	h, err := exec.Command("tmux", "display-message", "-t", "gw:active.1", "-p", "#{pane_height}").Output()
+	if err != nil {
+		return
+	}
+	width := strings.TrimSpace(string(w))
+	height := strings.TrimSpace(string(h))
+	if width == "" || height == "" {
+		return
+	}
+	exec.Command("tmux", "resize-window", "-t", "gw:"+winName, "-x", width, "-y", height).Run()
+}
+
 func isPaneDead(target string) bool {
 	out, _ := exec.Command("tmux", "display-message", "-t", target,
 		"-p", "#{pane_dead}").Output()
@@ -192,6 +469,9 @@ func switchToWindow(fromTitle, toTitle, toPath string, st State) {
 				"-t", "gw:"+fromSub+".0").Run()
 		}
 	}
+
+	// Match storage window size to active.1 before swapping in — prevents SIGWINCH.
+	resizeWindowToActive(toSub)
 
 	// Bring target pane into active.1.
 	exec.Command("tmux", "swap-pane",
