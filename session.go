@@ -154,7 +154,7 @@ while True:
 
     sys.stdout.write("\033[H")
     for line in lines:
-        sys.stdout.write(line[:25] + "\n")
+        sys.stdout.write("\033[2K" + line[:25] + "\n")
     sys.stdout.write("\033[J")
     sys.stdout.flush()
     time.sleep(1)
@@ -174,9 +174,11 @@ func writeMonitorScript() string {
 
 // windowsListScript renders all open tmux worktree windows grouped by project.
 // Each sub-window shows a colour-coded status with no program names:
-//   green  ● idle   — shell is in the foreground
-//   yellow ⠋ …      — a program is running (animated braille spinner)
-//   red    ✕ error  — pane is dead / unusable
+//
+//	blue   current  — sub-window is visible in the main pane
+//	green  ● idle   — shell is in the foreground
+//	yellow ⠋ …      — a program is running (animated braille spinner)
+//	red    ✕ error  — pane is dead / unusable
 const windowsListScript = `import subprocess, sys, time, json, os
 
 SHELLS = {'bash', 'zsh', 'fish', 'sh', 'dash', 'tcsh'}
@@ -193,11 +195,17 @@ def run(*args):
     except Exception:
         return ''
 
-def load_projects():
+def load_state():
     try:
         p = os.path.expanduser('~/.config/gw/state.json')
         with open(p) as f:
-            return [pr['name'] for pr in json.load(f).get('projects', [])]
+            return json.load(f)
+    except Exception:
+        return {}
+
+def load_projects(state):
+    try:
+        return [pr['name'] for pr in state.get('projects', [])]
     except Exception:
         return []
 
@@ -207,7 +215,11 @@ sys.stdout.flush()
 tick = 0
 
 while True:
-    projects = load_projects()
+    state = load_state()
+    projects = load_projects(state)
+    active_title = state.get('active_title', '')
+    active_subs = state.get('active_sub') or {}
+    active_sub = active_subs.get(active_title, active_title)
     raw = run('tmux', 'list-windows', '-t', 'gw', '-F', '#{window_name}').splitlines()
 
     buckets = {}
@@ -237,21 +249,24 @@ while True:
             out.append(c('38;5;243', (' ' + branch)[:W]))
             for sub in subs:
                 idx = sub.split('~')[1] if '~' in sub else '1'
-                dead = run('tmux', 'display-message', '-t', 'gw:' + sub + '.0', '-p', '#{pane_dead}')
-                if dead == '1':
-                    indicator = c('38;5;196', '✕ error')
+                if sub == active_sub:
+                    indicator = c('38;5;39', 'current')
                 else:
-                    cmd = run('tmux', 'display-message', '-t', 'gw:' + sub + '.0', '-p', '#{pane_current_command}')
-                    if cmd in SHELLS or not cmd:
-                        indicator = c('38;5;82', '● idle')
+                    dead = run('tmux', 'display-message', '-t', 'gw:' + sub + '.0', '-p', '#{pane_dead}')
+                    if dead == '1':
+                        indicator = c('38;5;196', '✕ error')
                     else:
-                        any_running = True
-                        indicator = c('38;5;226', SPIN[tick % len(SPIN)] + ' running')
+                        cmd = run('tmux', 'display-message', '-t', 'gw:' + sub + '.0', '-p', '#{pane_current_command}')
+                        if cmd in SHELLS or not cmd:
+                            indicator = c('38;5;82', '● idle')
+                        else:
+                            any_running = True
+                            indicator = c('38;5;226', SPIN[tick % len(SPIN)] + ' running')
                 out.append('  ' + idx + ' ' + indicator)
 
     sys.stdout.write('\033[H')
     for l in out:
-        sys.stdout.write(l + '\n')
+        sys.stdout.write('\033[2K' + l + '\n')
     sys.stdout.write('\033[J')
     sys.stdout.flush()
 
