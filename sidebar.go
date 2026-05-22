@@ -167,6 +167,7 @@ type sidebarModel struct {
 	dogLooking  bool
 	dogLookEnd  time.Time
 	dogNextLook time.Time
+	listOffset  int
 }
 
 func newSidebarModel() sidebarModel {
@@ -223,6 +224,7 @@ func (m *sidebarModel) prevItem() {
 	for i := m.cursor - 1; i >= 0; i-- {
 		if !m.items[i].isHeader {
 			m.cursor = i
+			m.ensureCursorVisible()
 			return
 		}
 	}
@@ -232,6 +234,7 @@ func (m *sidebarModel) nextItem() {
 	for i := m.cursor + 1; i < len(m.items); i++ {
 		if !m.items[i].isHeader {
 			m.cursor = i
+			m.ensureCursorVisible()
 			return
 		}
 	}
@@ -251,10 +254,10 @@ func (m *sidebarModel) refresh() {
 	if oldCursor < len(m.items) {
 		m.cursor = oldCursor
 	}
-	// Make sure cursor is on a worktree item
 	if m.cursor < len(m.items) && m.items[m.cursor].isHeader {
 		m.nextItem()
 	}
+	m.ensureCursorVisible()
 }
 
 // ── bubbletea ─────────────────────────────────────────────────────────────────
@@ -785,6 +788,169 @@ func (m sidebarModel) doSwitch(it listItem) tea.Cmd {
 	}
 }
 
+// ── Scroll helpers ────────────────────────────────────────────────────────────
+
+func (m sidebarModel) itemLineCount(it listItem) int {
+	if it.isHeader {
+		return 2
+	}
+	if it.isShell {
+		return 4
+	}
+	if it.branch != "" {
+		return 2
+	}
+	return 1
+}
+
+func (m sidebarModel) cursorLineStart() int {
+	if m.cursor >= len(m.items) {
+		return 0
+	}
+	off := 0
+	if m.inErr != "" {
+		off++
+	}
+	for i, it := range m.items {
+		if i == m.cursor {
+			return off
+		}
+		off += m.itemLineCount(it)
+	}
+	return off
+}
+
+func (m *sidebarModel) ensureCursorVisible() {
+	w := m.width
+	if w < 10 {
+		w = 30
+	}
+	h := m.height
+	if h < 10 {
+		h = 40
+	}
+	top := m.sidebarTop(w)
+	footer := m.sidebarFooter(w)
+	availH := h - strings.Count(top, "\n") - (strings.Count(footer, "\n") + 1)
+	if availH < 1 {
+		availH = 1
+	}
+	if m.cursor >= len(m.items) {
+		return
+	}
+	curStart := m.cursorLineStart()
+	curEnd := curStart + m.itemLineCount(m.items[m.cursor])
+	if curEnd > m.listOffset+availH {
+		m.listOffset = curEnd - availH
+	}
+	if curStart < m.listOffset {
+		m.listOffset = curStart
+	}
+	if m.listOffset < 0 {
+		m.listOffset = 0
+	}
+}
+
+func (m sidebarModel) sidebarTop(w int) string {
+	return m.dogView() + "\n" +
+		dimStyle.Render(strings.Repeat("─", w-1)) + "\n" +
+		sectionStyle.Render("worktrees") + "\n" +
+		dimStyle.Render(strings.Repeat("─", w-1)) + "\n"
+}
+
+func (m sidebarModel) sidebarFooter(w int) string {
+	col := (w - 2) / 2
+	div := dimStyle.Render(strings.Repeat("─", w-1))
+	return div + "\n" +
+		sectionStyle.Render("gw") + "\n" +
+		helpPair("↑↓ / k j  move", "enter / o  open", col) + "\n" +
+		helpPair("n  new worktree", "a  add project", col) + "\n" +
+		helpPair("D  rm worktree", "d  rm project", col) + "\n" +
+		helpPair("P  PR details", "C  create PR", col) + "\n" +
+		helpPair("r  refresh", "q  quit", col) + "\n" +
+		div + "\n" +
+		sectionStyle.Render("tmux") + "\n" +
+		helpPair("^a c  new", "^a n  next", col) + "\n" +
+		helpPair("^a p  prev", "^a s  sidebar", col) + "\n" +
+		helpPair("^a b  attach preview", "^a [  scroll mode", col)
+}
+
+func helpPair(left, right string, colW int) string {
+	l := pad(truncate(left, colW), colW)
+	return helpStyle.Render(l + "  " + truncate(right, colW))
+}
+
+func (m sidebarModel) buildListLines(w int) []string {
+	var lines []string
+	if m.inErr != "" {
+		lines = append(lines, errStyle.Render("! "+truncate(m.inErr, w-3)))
+	}
+	for i, it := range m.items {
+		if it.isHeader {
+			name := truncate(it.project.Name, w-2)
+			lines = append(lines, "")
+			lines = append(lines, sectionStyle.Render(name))
+			continue
+		}
+		isActive := it.title == m.state.ActiveTitle
+		isCursor := i == m.cursor
+		hasWindow := m.windows[it.title]
+		if it.isShell {
+			display := truncate(it.shellPath, w-4)
+			var line string
+			switch {
+			case isCursor && isActive:
+				line = activeStyle.Render("▶ " + display + " ●")
+			case isCursor:
+				line = activeStyle.Render("▶ " + display)
+			case isActive:
+				line = normalStyle.Render("  " + display + " ●")
+			default:
+				line = dimStyle.Render("  " + display)
+			}
+			lines = append(lines, "")
+			lines = append(lines, dimStyle.Render(strings.Repeat("─", w-1)))
+			lines = append(lines, dimStyle.Render("shell"))
+			lines = append(lines, line)
+			continue
+		}
+		var marker string
+		switch {
+		case isActive:
+			marker = " ●"
+		case hasWindow:
+			marker = " ◦"
+		}
+		display := it.display
+		if display == "" {
+			display = friendlyWorktreeName(it.project, it.worktree)
+		}
+		title := truncate(display, w-4-len(marker))
+		var titleLine string
+		switch {
+		case isCursor && isActive:
+			titleLine = activeStyle.Render("▶ " + title + marker)
+		case isCursor:
+			titleLine = activeStyle.Render("▶ " + title + marker)
+		case isActive:
+			titleLine = normalStyle.Render("  " + title + marker)
+		case hasWindow:
+			titleLine = normalStyle.Render("  " + title + marker)
+		default:
+			titleLine = dimStyle.Render("  " + title)
+		}
+		lines = append(lines, titleLine)
+		if it.branch != "" {
+			lines = append(lines, formatBranchLine(it.branch, it.worktree.PRInfo, w))
+		}
+	}
+	if len(m.items) == 0 {
+		lines = append(lines, dimStyle.Render("  no projects tracked"))
+		lines = append(lines, dimStyle.Render("  run gw from a git repo"))
+	}
+	return lines
+}
+
 // ── View ──────────────────────────────────────────────────────────────────────
 
 func (m sidebarModel) View() string {
@@ -847,120 +1013,49 @@ func (m sidebarModel) viewList() string {
 	if w < 10 {
 		w = 30
 	}
-
-	var sb strings.Builder
-	sb.WriteString(m.dogView() + "\n")
-	sb.WriteString(dimStyle.Render(strings.Repeat("─", w-1)) + "\n")
-	sb.WriteString(sectionStyle.Render("worktrees") + "\n")
-	sb.WriteString(dimStyle.Render(strings.Repeat("─", w-1)) + "\n")
-	if m.inErr != "" {
-		sb.WriteString(errStyle.Render("! "+truncate(m.inErr, w-3)) + "\n")
-	}
-
-	for i, it := range m.items {
-		if it.isHeader {
-			name := truncate(it.project.Name, w-2)
-			sb.WriteString("\n" + sectionStyle.Render(name) + "\n")
-			continue
-		}
-
-		isActive := it.title == m.state.ActiveTitle
-		isCursor := i == m.cursor
-		hasWindow := m.windows[it.title]
-
-		if it.isShell {
-			sb.WriteString("\n" + dimStyle.Render(strings.Repeat("─", w-1)) + "\n")
-			sb.WriteString(dimStyle.Render("shell") + "\n")
-			display := truncate(it.shellPath, w-4)
-			var line string
-			switch {
-			case isCursor && isActive:
-				line = activeStyle.Render("▶ " + display + " ●")
-			case isCursor:
-				line = activeStyle.Render("▶ " + display)
-			case isActive:
-				line = normalStyle.Render("  " + display + " ●")
-			default:
-				line = dimStyle.Render("  " + display)
-			}
-			sb.WriteString(line + "\n")
-			continue
-		}
-
-		var marker string
-		switch {
-		case isActive:
-			marker = " ●"
-		case hasWindow:
-			marker = " ◦"
-		}
-
-		display := it.display
-		if display == "" {
-			display = friendlyWorktreeName(it.project, it.worktree)
-		}
-		title := truncate(display, w-4-len(marker))
-		titleLine := ""
-		switch {
-		case isCursor && isActive:
-			titleLine = activeStyle.Render("▶ " + title + marker)
-		case isCursor:
-			titleLine = activeStyle.Render("▶ " + title + marker)
-		case isActive:
-			titleLine = normalStyle.Render("  " + title + marker)
-		case hasWindow:
-			titleLine = normalStyle.Render("  " + title + marker)
-		default:
-			titleLine = dimStyle.Render("  " + title)
-		}
-
-		sb.WriteString(titleLine + "\n")
-		if it.branch != "" {
-			sb.WriteString(formatBranchLine(it.branch, it.worktree.PRInfo, w) + "\n")
-		}
-		continue
-	}
-
-	if len(m.items) == 0 {
-		sb.WriteString(dimStyle.Render("  no projects tracked\n"))
-		sb.WriteString(dimStyle.Render("  run gw from a git repo\n"))
-	}
-
-	content := sb.String()
-
-	div := dimStyle.Render(strings.Repeat("─", w-1))
-	footer := div + "\n" +
-		sectionStyle.Render("gw") + "\n" +
-		helpStyle.Render("↑↓ / k j  move") + "\n" +
-		helpStyle.Render("enter / o  open") + "\n" +
-		helpStyle.Render("n  new worktree") + "\n" +
-		helpStyle.Render("a  add project") + "\n" +
-		helpStyle.Render("D  rm worktree") + "\n" +
-		helpStyle.Render("d  rm project") + "\n" +
-		helpStyle.Render("P  PR details") + "\n" +
-		helpStyle.Render("C  create PR") + "\n" +
-		helpStyle.Render("r  refresh") + "\n" +
-		helpStyle.Render("q  quit") + "\n" +
-		div + "\n" +
-		sectionStyle.Render("tmux") + "\n" +
-		helpStyle.Render("^a c  new") + "\n" +
-		helpStyle.Render("^a n  next") + "\n" +
-		helpStyle.Render("^a p  prev") + "\n" +
-		helpStyle.Render("^a s  sidebar") + "\n" +
-		helpStyle.Render("^a b  attach preview") + "\n" +
-		helpStyle.Render("^a [  scroll mode")
-
-	contentLines := strings.Count(content, "\n")
-	footerLines := strings.Count(footer, "\n") + 1
 	h := m.height
 	if h < 10 {
 		h = 40
 	}
-	gap := h - contentLines - footerLines
-	if gap < 1 {
-		gap = 1
+
+	top := m.sidebarTop(w)
+	footer := m.sidebarFooter(w)
+
+	topH := strings.Count(top, "\n")
+	footerH := strings.Count(footer, "\n") + 1
+	availH := h - topH - footerH
+	if availH < 1 {
+		availH = 1
 	}
-	return content + strings.Repeat("\n", gap) + footer
+
+	allLines := m.buildListLines(w)
+
+	offset := m.listOffset
+	maxOff := len(allLines) - availH
+	if maxOff < 0 {
+		maxOff = 0
+	}
+	if offset > maxOff {
+		offset = maxOff
+	}
+	if offset < 0 {
+		offset = 0
+	}
+
+	end := offset + availH
+	if end > len(allLines) {
+		end = len(allLines)
+	}
+
+	var mid strings.Builder
+	for _, l := range allLines[offset:end] {
+		mid.WriteString(l + "\n")
+	}
+	for i := end - offset; i < availH; i++ {
+		mid.WriteByte('\n')
+	}
+
+	return top + mid.String() + footer
 }
 
 func (m sidebarModel) viewCreate() string {
