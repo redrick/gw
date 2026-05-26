@@ -1127,9 +1127,13 @@ func openPRPopup(path string) tea.Cmd {
 		if err != nil {
 			return prPopupDoneMsg{err: err}
 		}
-		cmd := exec.Command("tmux", "display-popup", "-t", "gw:active.1", "-w", "90%", "-h", "90%", "-E", bin, "--pr-details", path)
-		if err := cmd.Run(); err != nil {
-			return prPopupDoneMsg{err: err}
+		cmd := exec.Command("tmux", "display-popup", "-w", "90%", "-h", "90%", "-E", bin, "--pr-details", path)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			msg := strings.TrimSpace(string(out))
+			if msg == "" {
+				msg = err.Error()
+			}
+			return prPopupDoneMsg{err: fmt.Errorf("display-popup: %s", msg)}
 		}
 		return prPopupDoneMsg{}
 	}
@@ -1728,9 +1732,13 @@ func openCreatePRPopup(path string) tea.Cmd {
 		if err != nil {
 			return prPopupDoneMsg{err: err}
 		}
-		cmd := exec.Command("tmux", "display-popup", "-t", "gw:active.1", "-w", "90%", "-h", "90%", "-E", bin, "--create-pr", path)
-		if err := cmd.Run(); err != nil {
-			return prPopupDoneMsg{err: err}
+		cmd := exec.Command("tmux", "display-popup", "-w", "90%", "-h", "90%", "-E", bin, "--create-pr", path)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			msg := strings.TrimSpace(string(out))
+			if msg == "" {
+				msg = err.Error()
+			}
+			return prPopupDoneMsg{err: fmt.Errorf("display-popup: %s", msg)}
 		}
 		return prPopupDoneMsg{}
 	}
