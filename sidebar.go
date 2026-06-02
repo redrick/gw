@@ -145,35 +145,57 @@ type prPopupDoneMsg struct {
 	err error
 }
 
+type branchCheckMsg struct {
+	branch        string
+	proj          Project
+	exists        bool
+	defaultBase   string
+	currentBranch string
+}
+
 type sidebarModel struct {
-	items       []listItem
-	cursor      int
-	view        sidebarView
-	input       textinput.Model
-	inErr       string
-	state       State
-	width       int
-	height      int
-	windows     map[string]bool
-	ready       bool
-	pending     pendingKind
-	pendingItem listItem
-	prContent   string
-	dogFrame    int
-	dogLastKey  time.Time
-	dogLastBark time.Time
-	dogBarking  bool
-	dogBarkEnd  time.Time
-	dogLooking  bool
-	dogLookEnd  time.Time
-	dogNextLook time.Time
-	listOffset  int
+	items         []listItem
+	cursor        int
+	view          sidebarView
+	input         textinput.Model
+	inErr         string
+	state         State
+	width         int
+	height        int
+	windows       map[string]bool
+	ready         bool
+	pending       pendingKind
+	pendingItem   listItem
+	prContent     string
+	dogFrame      int
+	dogLastKey    time.Time
+	dogLastBark   time.Time
+	dogBarking    bool
+	dogBarkEnd    time.Time
+	dogLooking    bool
+	dogLookEnd    time.Time
+	dogNextLook   time.Time
+	listOffset    int
+	searching     bool
+	searchInput   textinput.Model
+	searchMatches []int
+	searchCursor  int
+	// viewCreate step 2: base branch picker for new branches
+	createStep          int    // 0 = typing name, 1 = picking base
+	createBranch        string // branch name confirmed in step 0
+	createBaseChoice    int    // 0 = default (main), 1 = current branch
+	createDefaultBase   string
+	createCurrentBranch string
 }
 
 func newSidebarModel() sidebarModel {
 	ti := textinput.New()
 	ti.Placeholder = "branch-name"
 	ti.CharLimit = 100
+
+	si := textinput.New()
+	si.Placeholder = "search…"
+	si.CharLimit = 100
 
 	st := loadState()
 	items := buildItems(st)
@@ -203,7 +225,7 @@ func newSidebarModel() sidebarModel {
 	}
 
 	now := time.Now()
-	return sidebarModel{items: items, cursor: cursor, input: ti, state: st, windows: liveWindows(), dogLastKey: now, dogLastBark: now, dogNextLook: now.Add(5 * time.Second)}
+	return sidebarModel{items: items, cursor: cursor, input: ti, searchInput: si, state: st, windows: liveWindows(), dogLastKey: now, dogLastBark: now, dogNextLook: now.Add(5 * time.Second)}
 }
 
 func runSidebar() {
@@ -420,6 +442,9 @@ func (m sidebarModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case viewConfirm:
 		return m.updateConfirm(msg)
 	default:
+		if m.searching {
+			return m.updateSearch(msg)
+		}
 		return m.updateList(msg)
 	}
 }
@@ -516,14 +541,152 @@ func (m sidebarModel) updateList(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "r":
 			m.refresh()
 			m.windows = liveWindows()
+		case "/":
+			m.searching = true
+			m.searchInput.SetValue("")
+			m.searchCursor = 0
+			m.searchInput.Focus()
+			m.listOffset = 0
+			m.recomputeSearchMatches()
+			return m, textinput.Blink
 		}
 	}
 	return m, nil
 }
 
-func (m sidebarModel) updateCreate(msg tea.Msg) (tea.Model, tea.Cmd) {
+func (m sidebarModel) itemMatchesSearch(it listItem, q string) bool {
+	if q == "" {
+		return true
+	}
+	if strings.Contains(strings.ToLower(it.project.Name), q) {
+		return true
+	}
+	if strings.Contains(strings.ToLower(it.branch), q) {
+		return true
+	}
+	if strings.Contains(strings.ToLower(it.display), q) {
+		return true
+	}
+	if it.isShell && strings.Contains(strings.ToLower(it.shellPath), q) {
+		return true
+	}
+	return false
+}
+
+func (m *sidebarModel) recomputeSearchMatches() {
+	q := strings.ToLower(m.searchInput.Value())
+	m.searchMatches = nil
+	for i, it := range m.items {
+		if it.isHeader {
+			continue
+		}
+		if m.itemMatchesSearch(it, q) {
+			m.searchMatches = append(m.searchMatches, i)
+		}
+	}
+	if m.searchCursor >= len(m.searchMatches) {
+		m.searchCursor = max(0, len(m.searchMatches)-1)
+	}
+	if len(m.searchMatches) > 0 {
+		m.cursor = m.searchMatches[m.searchCursor]
+	}
+}
+
+func (m sidebarModel) updateSearch(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
+		switch msg.String() {
+		case "esc", "ctrl+c":
+			m.searching = false
+			m.searchInput.Blur()
+			return m, nil
+		case "enter":
+			if len(m.searchMatches) > 0 {
+				it := m.items[m.searchMatches[m.searchCursor]]
+				m.searching = false
+				m.searchInput.Blur()
+				m.cursor = m.searchMatches[m.searchCursor]
+				return m, m.doSwitch(it)
+			}
+			return m, nil
+		case "up":
+			if m.searchCursor > 0 {
+				m.searchCursor--
+				m.cursor = m.searchMatches[m.searchCursor]
+			}
+			return m, nil
+		case "down":
+			if m.searchCursor < len(m.searchMatches)-1 {
+				m.searchCursor++
+				m.cursor = m.searchMatches[m.searchCursor]
+			}
+			return m, nil
+		}
+	}
+	var cmd tea.Cmd
+	m.searchInput, cmd = m.searchInput.Update(msg)
+	m.searchCursor = 0
+	m.recomputeSearchMatches()
+	return m, cmd
+}
+
+func (m sidebarModel) updateCreate(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case branchCheckMsg:
+		if msg.exists {
+			// branch already exists — check it out directly, no picker needed
+			proj := msg.proj
+			branch := msg.branch
+			return m, func() tea.Msg {
+				wt, title, err := addWorktree(proj.Path, proj.Name, branch, "")
+				return worktreeAdded{wt: wt, title: title, proj: proj, err: err}
+			}
+		}
+		m.createStep = 1
+		m.createBranch = msg.branch
+		m.createDefaultBase = msg.defaultBase
+		m.createCurrentBranch = msg.currentBranch
+		m.createBaseChoice = 0
+		return m, nil
+	case tea.KeyMsg:
+		if m.createStep == 1 {
+			switch msg.String() {
+			case "ctrl+c":
+				return m, tea.Quit
+			case "esc":
+				m.createStep = 0
+				m.input.Focus()
+				return m, textinput.Blink
+			case "up", "down", "left", "right", "tab", "h", "l", "j", "k":
+				// only two choices; if both are the same there's nothing to toggle
+				if m.createDefaultBase != m.createCurrentBranch {
+					if m.createBaseChoice == 0 {
+						m.createBaseChoice = 1
+					} else {
+						m.createBaseChoice = 0
+					}
+				}
+				return m, nil
+			case "enter":
+				it := m.currentItem()
+				if it == nil {
+					return m, nil
+				}
+				proj := it.project
+				branch := m.createBranch
+				startPoint := m.createDefaultBase
+				if m.createBaseChoice == 1 {
+					startPoint = m.createCurrentBranch
+				}
+				m.createStep = 0
+				return m, func() tea.Msg {
+					wt, title, err := addWorktree(proj.Path, proj.Name, branch, startPoint)
+					return worktreeAdded{wt: wt, title: title, proj: proj, err: err}
+				}
+			}
+			return m, nil
+		}
+		// step 0: typing branch name
 		switch msg.String() {
 		case "ctrl+c":
 			return m, tea.Quit
@@ -542,14 +705,25 @@ func (m sidebarModel) updateCreate(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			proj := it.project
 			return m, func() tea.Msg {
-				wt, title, err := addWorktree(proj.Path, proj.Name, branch)
-				return worktreeAdded{wt: wt, title: title, proj: proj, err: err}
+				exists := branchExists(proj.Path, branch)
+				currentBranch, _ := gitOutput(proj.Path, "rev-parse", "--abbrev-ref", "HEAD")
+				defaultBase := configuredBase(proj.Path, currentBranch)
+				return branchCheckMsg{
+					branch:        branch,
+					proj:          proj,
+					exists:        exists,
+					defaultBase:   defaultBase,
+					currentBranch: currentBranch,
+				}
 			}
 		}
 	}
-	var cmd tea.Cmd
-	m.input, cmd = m.input.Update(msg)
-	return m, cmd
+	if m.createStep == 0 {
+		var cmd tea.Cmd
+		m.input, cmd = m.input.Update(msg)
+		return m, cmd
+	}
+	return m, nil
 }
 
 func (m sidebarModel) updateAddProject(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -852,9 +1026,13 @@ func (m *sidebarModel) ensureCursorVisible() {
 }
 
 func (m sidebarModel) sidebarTop(w int) string {
+	label := sectionStyle.Render("worktrees")
+	if m.searching {
+		label = activeStyle.Render("/") + " " + m.searchInput.View()
+	}
 	return m.dogView() + "\n" +
 		dimStyle.Render(strings.Repeat("─", w-1)) + "\n" +
-		sectionStyle.Render("worktrees") + "\n" +
+		label + "\n" +
 		dimStyle.Render(strings.Repeat("─", w-1)) + "\n"
 }
 
@@ -868,6 +1046,7 @@ func (m sidebarModel) sidebarFooter(w int) string {
 		helpPair("D  rm worktree", "d  rm project", col) + "\n" +
 		helpPair("P  PR details", "C  create PR", col) + "\n" +
 		helpPair("r  refresh", "q  quit", col) + "\n" +
+		helpPair("/  search", "", col) + "\n" +
 		div + "\n" +
 		sectionStyle.Render("tmux") + "\n" +
 		helpPair("^a c  new", "^a n  next", col) + "\n" +
@@ -951,6 +1130,65 @@ func (m sidebarModel) buildListLines(w int) []string {
 	return lines
 }
 
+func (m sidebarModel) buildSearchLines(w int) []string {
+	var lines []string
+	for _, i := range m.searchMatches {
+		it := m.items[i]
+		isActive := it.title == m.state.ActiveTitle
+		isCursor := i == m.cursor
+		hasWindow := m.windows[it.title]
+		if it.isShell {
+			display := truncate(it.shellPath, w-4)
+			var line string
+			switch {
+			case isCursor && isActive:
+				line = activeStyle.Render("▶ " + display + " ●")
+			case isCursor:
+				line = activeStyle.Render("▶ " + display)
+			case isActive:
+				line = normalStyle.Render("  " + display + " ●")
+			default:
+				line = dimStyle.Render("  " + display)
+			}
+			lines = append(lines, line)
+			continue
+		}
+		repoLabel := dimStyle.Render(truncate(it.project.Name, w-2))
+		lines = append(lines, repoLabel)
+		var marker string
+		switch {
+		case isActive:
+			marker = " ●"
+		case hasWindow:
+			marker = " ◦"
+		}
+		display := it.display
+		if display == "" {
+			display = friendlyWorktreeName(it.project, it.worktree)
+		}
+		title := truncate(display, w-4-len(marker))
+		var titleLine string
+		switch {
+		case isCursor:
+			titleLine = activeStyle.Render("▶ " + title + marker)
+		case isActive:
+			titleLine = normalStyle.Render("  " + title + marker)
+		case hasWindow:
+			titleLine = normalStyle.Render("  " + title + marker)
+		default:
+			titleLine = dimStyle.Render("  " + title)
+		}
+		lines = append(lines, titleLine)
+		if it.branch != "" {
+			lines = append(lines, formatBranchLine(it.branch, it.worktree.PRInfo, w))
+		}
+	}
+	if len(lines) == 0 {
+		lines = append(lines, dimStyle.Render("  no matches"))
+	}
+	return lines
+}
+
 // ── View ──────────────────────────────────────────────────────────────────────
 
 func (m sidebarModel) View() string {
@@ -1028,7 +1266,12 @@ func (m sidebarModel) viewList() string {
 		availH = 1
 	}
 
-	allLines := m.buildListLines(w)
+	var allLines []string
+	if m.searching {
+		allLines = m.buildSearchLines(w)
+	} else {
+		allLines = m.buildListLines(w)
+	}
 
 	offset := m.listOffset
 	maxOff := len(allLines) - availH
@@ -1064,6 +1307,21 @@ func (m sidebarModel) viewCreate() string {
 	if it := m.currentItem(); it != nil {
 		sb.WriteString(dimStyle.Render("repo:   ") + normalStyle.Render(truncate(it.project.Name, m.width-9)) + "\n")
 		sb.WriteString(dimStyle.Render("path:   ") + dimStyle.Render(truncate(it.project.Path, m.width-9)) + "\n\n")
+	}
+	if m.createStep == 1 {
+		sb.WriteString(dimStyle.Render("branch: ") + normalStyle.Render(m.createBranch) + "\n\n")
+		sb.WriteString(dimStyle.Render("base:") + "\n")
+		mainLabel := truncate(m.createDefaultBase, m.width-6)
+		curLabel := truncate(m.createCurrentBranch, m.width-6)
+		if m.createBaseChoice == 0 {
+			sb.WriteString(activeStyle.Render("▶ " + mainLabel) + "\n")
+			sb.WriteString(dimStyle.Render("  " + curLabel) + "\n")
+		} else {
+			sb.WriteString(dimStyle.Render("  " + mainLabel) + "\n")
+			sb.WriteString(activeStyle.Render("▶ " + curLabel) + "\n")
+		}
+		sb.WriteString("\n" + helpStyle.Render("↑↓ / ←→  switch   enter  create   esc  back"))
+		return sb.String()
 	}
 	sb.WriteString("branch: " + m.input.View() + "\n")
 	if m.inErr != "" {

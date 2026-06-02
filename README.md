@@ -55,6 +55,8 @@ If you re-run `gw` while a session is already open, it re-attaches to it.
 | `d` | remove project from tracking |
 | `P` | open PR details for the current branch |
 | `C` | create a PR for the current branch |
+| `/` | search worktrees |
+| `↑↓` (in search) | cycle matches |
 | `r` | refresh worktree list |
 | `q` | quit and kill session |
 

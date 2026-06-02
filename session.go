@@ -684,7 +684,7 @@ func removeWorktree(projectPath, wtPath, title string, isActive bool, st State) 
 	return nil
 }
 
-func addWorktree(projectPath, projectName, branch string) (Worktree, string, error) {
+func addWorktree(projectPath, projectName, branch, startPoint string) (Worktree, string, error) {
 	safe := strings.ReplaceAll(branch, "/", "-")
 	wtPath := filepath.Join(filepath.Dir(projectPath), filepath.Base(projectPath)+"-"+safe)
 
@@ -696,9 +696,12 @@ func addWorktree(projectPath, projectName, branch string) (Worktree, string, err
 		out, err = exec.Command("git", "-C", projectPath, "worktree", "add",
 			wtPath, branch).CombinedOutput()
 	} else {
-		// Brand-new branch — create it.
-		out, err = exec.Command("git", "-C", projectPath, "worktree", "add",
-			"-b", branch, wtPath).CombinedOutput()
+		// Brand-new branch — create it from startPoint (or HEAD if empty).
+		args := []string{"-C", projectPath, "worktree", "add", "-b", branch, wtPath}
+		if startPoint != "" {
+			args = append(args, startPoint)
+		}
+		out, err = exec.Command("git", args...).CombinedOutput()
 	}
 	if err != nil {
 		return Worktree{}, "", fmt.Errorf("%s", strings.TrimSpace(string(out)))
