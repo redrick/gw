@@ -624,9 +624,12 @@ func (m sidebarModel) updateSearch(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	}
 	var cmd tea.Cmd
+	oldVal := m.searchInput.Value()
 	m.searchInput, cmd = m.searchInput.Update(msg)
-	m.searchCursor = 0
-	m.recomputeSearchMatches()
+	if m.searchInput.Value() != oldVal {
+		m.searchCursor = 0
+		m.recomputeSearchMatches()
+	}
 	return m, cmd
 }
 
