@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 )
 
 func main() {
@@ -52,11 +53,17 @@ func launch() {
 	if wd != "" && isGitRepo(wd) {
 		if root, err := gitRepoRoot(wd); err == nil {
 			st.AddProject(root)
+			// Remember the worktree we launched from so the sidebar defaults
+			// its cursor to it instead of the first item in the list.
+			st.LaunchWorktree = filepath.Clean(root)
 		}
 	}
 
 	if tmuxSessionExists("gw") {
 		saveState(st)
+		// Redeploy the monitor script so a rebuilt binary's notification logic
+		// takes effect on reattach without killing the session.
+		refreshMonitorPane()
 		cmd := exec.Command("tmux", "attach-session", "-t", "gw")
 		cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
 		cmd.Run()
@@ -68,6 +75,17 @@ func launch() {
 		st.LaunchedFromShell = true
 	} else {
 		st.LaunchedFromShell = false
+	}
+	// A fresh session starts with the bootstrap shell in active.1 — no worktree
+	// is swapped in yet. Reset the stale ActiveTitle carried over from a previous
+	// session so the sidebar doesn't falsely mark (and highlight) a worktree as
+	// active. Leaving it stale desyncs switchToWindow: selecting that worktree
+	// runs with from==to and its two swap-panes cancel out, so it never enters
+	// active.1 and becomes unreachable.
+	if st.LaunchedFromShell {
+		st.ActiveTitle = "gw-shell"
+	} else {
+		st.ActiveTitle = ""
 	}
 	saveState(st)
 	setupTmuxSession()

@@ -24,12 +24,21 @@ type State struct {
 	ActiveSub         map[string]string `json:"active_sub,omitempty"`
 	LaunchDir         string            `json:"launch_dir,omitempty"`
 	LaunchedFromShell bool              `json:"launched_from_shell,omitempty"`
+	LaunchWorktree    string            `json:"launch_worktree,omitempty"`
 	PinnedPreview     string            `json:"pinned_preview,omitempty"`
 }
 
 func statePath() string {
 	dir, _ := os.UserConfigDir()
 	return filepath.Join(dir, "gw", "state.json")
+}
+
+// switchRequestPath holds a worktree title written by the monitor (e.g. when a
+// desktop notification is clicked) requesting the sidebar switch its active
+// slot to that worktree. The sidebar consumes and deletes it on its tick.
+func switchRequestPath() string {
+	dir, _ := os.UserConfigDir()
+	return filepath.Join(dir, "gw", "switch_request")
 }
 
 func loadState() State {
@@ -175,16 +184,51 @@ func writeMonitorScript() string {
 // windowsListScript renders all open tmux worktree windows grouped by project.
 // Each sub-window shows a colour-coded status with no program names:
 //
-//	blue   current  — sub-window is visible in the main pane
-//	green  ● idle   — shell is in the foreground
-//	yellow ⠋ …      — a program is running (animated braille spinner)
-//	red    ✕ error  — pane is dead / unusable
-const windowsListScript = `import subprocess, sys, time, json, os
+//	blue   current   — sub-window is visible in the main pane
+//	green  ● idle    — shell is in the foreground
+//	yellow ⠋ running — a program is running (animated braille spinner)
+//	orange ⚠ input   — an agent (claude/codex/…) is waiting for permission
+//	red    ✕ error   — pane is dead / unusable
+//
+// "input" detection works by scraping each running agent pane with capture-pane
+// and matching known permission-prompt patterns. On the rising edge (a pane that
+// was not waiting starts waiting) a desktop notification is fired via notify-send
+// so the user can find which background worktree needs attention without hunting
+// through tabs. Patterns can be overridden with the GW_ATTN_PATTERNS env var
+// (a '|'-separated, case-insensitive substring list).
+const windowsListScript = `import subprocess, sys, time, json, os, shutil, threading
 
 SHELLS = {'bash', 'zsh', 'fish', 'sh', 'dash', 'tcsh'}
 W = 24
 RST = '\033[0m'
 SPIN = '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
+
+# Permission-prompt markers for claude / codex and similar agents. Matched as
+# case-insensitive substrings against the visible pane text.
+DEFAULT_PATTERNS = [
+    'do you want to proceed',
+    'do you want to make this edit',
+    'do you want to create',
+    'do you want to run',
+    'allow command',
+    'allow this command',
+    'approve this',
+    'waiting for your approval',
+    '❯ 1. yes',
+    '1. yes',
+]
+_env = os.environ.get('GW_ATTN_PATTERNS', '')
+PATTERNS = [p.strip().lower() for p in _env.split('|') if p.strip()] if _env else DEFAULT_PATTERNS
+
+NOTIFY = shutil.which('notify-send')
+# gdbus lets us actively close a still-open notification by id. Critical-urgency
+# notifications never auto-expire, so we use this to dismiss them after a timeout.
+CLOSER = shutil.which('gdbus')
+NOTIFY_TIMEOUT = float(os.environ.get('GW_NOTIFY_TIMEOUT', '35'))
+# WM activators for raising the terminal when a notification is clicked. wmctrl
+# is preferred; xdotool is the fallback. Both no-op gracefully when absent.
+WMCTRL = shutil.which('wmctrl') if os.environ.get('DISPLAY') else None
+XDOTOOL = shutil.which('xdotool') if os.environ.get('DISPLAY') else None
 
 def c(code, text):
     return f'\033[{code}m{text}{RST}'
@@ -194,6 +238,140 @@ def run(*args):
         return subprocess.check_output(list(args), stderr=subprocess.DEVNULL).decode().strip()
     except Exception:
         return ''
+
+def capture(target):
+    try:
+        return subprocess.check_output(
+            ['tmux', 'capture-pane', '-p', '-t', target],
+            stderr=subprocess.DEVNULL).decode(errors='replace').lower()
+    except Exception:
+        return ''
+
+def waiting_for_input(sub, active=False):
+    # The active worktree's live pane is swapped into gw:active.1; its storage
+    # window gw:<sub>.0 holds the displaced idle shell. Capture the right pane.
+    target = 'gw:active.1' if active else 'gw:' + sub + '.0'
+    txt = capture(target)
+    return any(p in txt for p in PATTERNS)
+
+def _ppid(pid):
+    # Parent pid from /proc/<pid>/stat. comm field is parenthesized and may itself
+    # contain spaces/parens, so parse after the final ')': fields are state, ppid...
+    try:
+        with open('/proc/%d/stat' % pid) as f:
+            data = f.read()
+        return int(data[data.rfind(')') + 1:].split()[1])
+    except Exception:
+        return 0
+
+def _win_for_pid(pid):
+    # Window id of the top-level window owned by pid, or None. wmctrl -lp gives a
+    # pid->winid table; xdotool can search by pid directly. Returns first match.
+    if WMCTRL:
+        for line in run(WMCTRL, '-lp').splitlines():
+            parts = line.split(None, 4)
+            if len(parts) >= 3 and parts[2] == str(pid):
+                return parts[0]
+        return None
+    if XDOTOOL:
+        ids = run(XDOTOOL, 'search', '--all', '--pid', str(pid)).split()
+        return ids[0] if ids else None
+    return None
+
+def _activate_win(winid):
+    if WMCTRL:
+        subprocess.run([WMCTRL, '-i', '-a', winid],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    elif XDOTOOL:
+        subprocess.run([XDOTOOL, 'windowactivate', winid],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+def raise_terminal():
+    # tmux select-window only changes the active window *inside* the session; if
+    # the terminal is alt-tabbed away the user never sees the switch. Walk each
+    # attached gw client's pid up its ppid chain until one maps to a top-level
+    # window, then activate it so the terminal comes to the foreground.
+    if not (WMCTRL or XDOTOOL):
+        return
+    for cp in run('tmux', 'list-clients', '-t', 'gw', '-F', '#{client_pid}').split():
+        try:
+            p = int(cp)
+        except ValueError:
+            continue
+        depth = 0
+        while p > 1 and depth < 40:
+            wid = _win_for_pid(p)
+            if wid:
+                _activate_win(wid)
+                return
+            p = _ppid(p)
+            depth += 1
+
+def focus(sub):
+    # Bring the gw session to the worktree that needs input, then raise the
+    # hosting terminal in the WM. We must NOT select-window onto gw:<sub>: that
+    # storage window holds the worktree's bare pane and showing it directly
+    # destroys the composed gw layout (sidebar + active + preview live in
+    # gw:active). Instead drop a switch request for the sidebar to consume — it
+    # performs the proper server-side swap-pane — and surface gw:active.
+    base = sub.split('~')[0]
+    try:
+        p = os.path.expanduser('~/.config/gw/switch_request')
+        with open(p, 'w') as f:
+            f.write(base)
+    except Exception:
+        pass
+    try:
+        subprocess.run(['tmux', 'select-window', '-t', 'gw:active'],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+    raise_terminal()
+
+def notify(proj, branch, idx, sub):
+    if not NOTIFY:
+        return
+    where = proj + '/' + branch + (' #' + idx if idx != '1' else '')
+    # Run notify-send with --wait so it blocks until the notification is acted on
+    # or dismissed; --action makes clicking the body emit 'default' on stdout, and
+    # -p prints the notification id on the first line. Critical urgency means the
+    # daemon never auto-expires it, so a timer thread closes it by id via gdbus
+    # after NOTIFY_TIMEOUT seconds. We use Popen (not run) so the id is readable
+    # while --wait still blocks. Runs in a daemon thread so the loop keeps drawing.
+    def worker():
+        try:
+            p = subprocess.Popen(
+                [NOTIFY, '-u', 'critical', '-a', 'gw', '--wait', '-p',
+                 '--action=default=Open', '⚠ worktree needs input', where],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        except Exception:
+            return
+        nid = (p.stdout.readline().decode(errors='replace').strip()
+               if p.stdout else '')
+        timer = None
+        if nid and CLOSER:
+            def close():
+                try:
+                    subprocess.run(
+                        [CLOSER, 'call', '--session',
+                         '--dest', 'org.freedesktop.Notifications',
+                         '--object-path', '/org/freedesktop/Notifications',
+                         '--method',
+                         'org.freedesktop.Notifications.CloseNotification', nid],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                except Exception:
+                    pass
+            timer = threading.Timer(NOTIFY_TIMEOUT, close)
+            timer.daemon = True
+            timer.start()
+        # Any remaining stdout is the invoked action key; 'default' = body click.
+        rest = p.stdout.read().decode(errors='replace') if p.stdout else ''
+        p.wait()
+        if timer:
+            timer.cancel()
+        if 'default' in rest.split():
+            focus(sub)
+    threading.Thread(target=worker, daemon=True).start()
 
 def load_state():
     try:
@@ -213,6 +391,9 @@ sys.stdout.write('\033[?7l')
 sys.stdout.flush()
 
 tick = 0
+# Per-sub latch: True while we've already notified for the current prompt, so we
+# fire notify-send exactly once per rising edge (cleared when the prompt clears).
+attn_latch = {}
 
 while True:
     state = load_state()
@@ -240,6 +421,8 @@ while True:
 
     out = []
     any_running = False
+    any_attn = False
+    seen_subs = set()
 
     for proj in bucket_order:
         out.append(c('38;5;99;1', proj[:W]))
@@ -248,21 +431,46 @@ while True:
             branch = rest[len(proj)+1:] if rest.startswith(proj + '-') else rest
             out.append(c('38;5;243', (' ' + branch)[:W]))
             for sub in subs:
+                seen_subs.add(sub)
                 idx = sub.split('~')[1] if '~' in sub else '1'
                 if sub == active_sub:
                     indicator = c('38;5;39', 'current')
+                    # Notify on every rising edge, even for the current window — you
+                    # may have alt-tabbed away, and a missed prompt is worse than a
+                    # redundant ping. The latch keeps it to one notify per prompt.
+                    if waiting_for_input(sub, active=True):
+                        any_attn = True
+                        if not attn_latch.get(sub):
+                            notify(proj, branch, idx, sub)
+                            attn_latch[sub] = True
+                    else:
+                        attn_latch.pop(sub, None)
                 else:
                     dead = run('tmux', 'display-message', '-t', 'gw:' + sub + '.0', '-p', '#{pane_dead}')
                     if dead == '1':
                         indicator = c('38;5;196', '✕ error')
+                        attn_latch.pop(sub, None)
                     else:
                         cmd = run('tmux', 'display-message', '-t', 'gw:' + sub + '.0', '-p', '#{pane_current_command}')
                         if cmd in SHELLS or not cmd:
                             indicator = c('38;5;82', '● idle')
+                            attn_latch.pop(sub, None)
+                        elif waiting_for_input(sub):
+                            any_attn = True
+                            indicator = c('1;38;5;208', '⚠ input')
+                            if not attn_latch.get(sub):
+                                notify(proj, branch, idx, sub)
+                                attn_latch[sub] = True
                         else:
                             any_running = True
                             indicator = c('38;5;226', SPIN[tick % len(SPIN)] + ' running')
+                            attn_latch.pop(sub, None)
                 out.append('  ' + idx + ' ' + indicator)
+
+    # Drop latches for windows that no longer exist.
+    for k in list(attn_latch):
+        if k not in seen_subs:
+            attn_latch.pop(k, None)
 
     sys.stdout.write('\033[H')
     for l in out:
@@ -271,7 +479,7 @@ while True:
     sys.stdout.flush()
 
     tick += 1
-    time.sleep(0.15 if any_running else 1.0)
+    time.sleep(0.15 if (any_running or any_attn) else 1.0)
 `
 
 func windowsListScriptPath() string {
@@ -332,11 +540,38 @@ func ensurePreviewColumn() {
 	listID := strings.TrimSpace(string(out))
 
 	listScript := writeWindowsListScript()
+	// Tag the pane so refreshMonitorPane can find and respawn it on relaunch,
+	// picking up an updated script without killing the session.
+	exec.Command("tmux", "set-option", "-p", "-t", listID, "@gw_pane", "list").Run()
 	exec.Command("tmux", "send-keys", "-t", listID, "python3 "+listScript, "Enter").Run()
 	monitorScript := writeMonitorScript()
 	exec.Command("tmux", "send-keys", "-t", monitorID, "python3 "+monitorScript, "Enter").Run()
 
 	previewReady = true
+}
+
+// refreshMonitorPane rewrites the windows-list script to disk and respawns the
+// live list pane so script changes take effect on relaunch — without requiring
+// the user to kill the whole gw session. No-op when the session or tagged pane
+// is absent (e.g. a session created by an older binary that never tagged it).
+func refreshMonitorPane() {
+	if !tmuxSessionExists("gw") {
+		return
+	}
+	script := writeWindowsListScript()
+	out, err := exec.Command("tmux", "list-panes", "-t", "gw:active",
+		"-F", "#{pane_id} #{@gw_pane}").Output()
+	if err != nil {
+		return
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 2 && fields[1] == "list" {
+			exec.Command("tmux", "respawn-pane", "-k", "-t", fields[0],
+				"python3 "+script).Run()
+			return
+		}
+	}
 }
 
 // updatePreviewTarget ensures the preview column is created. Called on every

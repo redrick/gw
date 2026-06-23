@@ -210,16 +210,23 @@ func newSidebarModel() sidebarModel {
 			}
 		}
 	} else {
-		// Otherwise restore last active worktree, or fall back to first item.
+		// Prefer the worktree we launched gw from; otherwise restore the last
+		// active worktree, or fall back to the first item.
 		for i, it := range items {
-			if !it.isHeader {
-				if cursor == 0 {
-					cursor = i
-				}
-				if it.title == st.ActiveTitle {
+			if it.isHeader {
+				continue
+			}
+			if cursor == 0 {
+				cursor = i
+			}
+			if st.LaunchWorktree != "" {
+				if !it.isShell && filepath.Clean(it.worktree.Path) == st.LaunchWorktree {
 					cursor = i
 					break
 				}
+			} else if it.title == st.ActiveTitle {
+				cursor = i
+				break
 			}
 		}
 	}
@@ -297,6 +304,12 @@ func (m sidebarModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	switch msg := msg.(type) {
 	case dogTickMsg:
+		// A notification click (or any external trigger) may have requested a
+		// switch. Consume it here so the switch goes through the normal
+		// swap-pane path and keeps the gw layout intact.
+		if it, ok := m.checkSwitchRequest(); ok {
+			return m, tea.Batch(m.doSwitch(it), dogTickCmd(100*time.Millisecond))
+		}
 		now := time.Now()
 		if m.dogBarking {
 			if now.After(m.dogBarkEnd) {
@@ -944,6 +957,33 @@ func commonPrefix(a, b string) string {
 		}
 	}
 	return a[:n]
+}
+
+// checkSwitchRequest consumes a pending switch request (written by the monitor
+// when a notification is clicked) and returns the matching item to switch to.
+// Returns ok=false when there is no request or no matching worktree.
+func (m *sidebarModel) checkSwitchRequest() (listItem, bool) {
+	p := switchRequestPath()
+	data, err := os.ReadFile(p)
+	if err != nil {
+		return listItem{}, false
+	}
+	os.Remove(p)
+	want := strings.TrimSpace(string(data))
+	if want == "" {
+		return listItem{}, false
+	}
+	for i, it := range m.items {
+		if it.isHeader {
+			continue
+		}
+		if it.title == want {
+			m.cursor = i
+			m.ensureCursorVisible()
+			return it, true
+		}
+	}
+	return listItem{}, false
 }
 
 func (m sidebarModel) doSwitch(it listItem) tea.Cmd {
