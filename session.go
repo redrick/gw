@@ -215,7 +215,6 @@ DEFAULT_PATTERNS = [
     'approve this',
     'waiting for your approval',
     '❯ 1. yes',
-    '1. yes',
 ]
 _env = os.environ.get('GW_ATTN_PATTERNS', '')
 PATTERNS = [p.strip().lower() for p in _env.split('|') if p.strip()] if _env else DEFAULT_PATTERNS
@@ -391,9 +390,37 @@ sys.stdout.write('\033[?7l')
 sys.stdout.flush()
 
 tick = 0
-# Per-sub latch: True while we've already notified for the current prompt, so we
-# fire notify-send exactly once per rising edge (cleared when the prompt clears).
-attn_latch = {}
+# Per-sub attention state: {'notified': bool, 'clear': int}. We fire notify-send
+# once per rising edge and must NOT re-fire while the prompt is still on screen.
+# The pattern match flaps (the agent pane redraws/scrolls, so a matched line can
+# briefly leave the captured viewport), so we don't re-arm the moment a match
+# disappears — we require ATTN_CLEAR_FRAMES consecutive non-waiting polls first.
+# Without this debounce an idle window flips waiting->clear->waiting every poll
+# and notifies forever.
+attn_state = {}
+ATTN_CLEAR_FRAMES = 3
+
+def attn_mark(sub):
+    # Pane is waiting. Returns True only on a fresh rising edge (caller notifies).
+    s = attn_state.get(sub)
+    if s is None:
+        s = {'notified': False, 'clear': 0}
+        attn_state[sub] = s
+    s['clear'] = 0
+    if not s['notified']:
+        s['notified'] = True
+        return True
+    return False
+
+def attn_clear(sub):
+    # Pane is not waiting. Re-arm only after enough consecutive clear polls so a
+    # transient match dropout doesn't reset the latch and re-notify.
+    s = attn_state.get(sub)
+    if s is None:
+        return
+    s['clear'] += 1
+    if s['clear'] >= ATTN_CLEAR_FRAMES:
+        attn_state.pop(sub, None)
 
 while True:
     state = load_state()
@@ -440,37 +467,35 @@ while True:
                     # redundant ping. The latch keeps it to one notify per prompt.
                     if waiting_for_input(sub, active=True):
                         any_attn = True
-                        if not attn_latch.get(sub):
+                        if attn_mark(sub):
                             notify(proj, branch, idx, sub)
-                            attn_latch[sub] = True
                     else:
-                        attn_latch.pop(sub, None)
+                        attn_clear(sub)
                 else:
                     dead = run('tmux', 'display-message', '-t', 'gw:' + sub + '.0', '-p', '#{pane_dead}')
                     if dead == '1':
                         indicator = c('38;5;196', '✕ error')
-                        attn_latch.pop(sub, None)
+                        attn_clear(sub)
                     else:
                         cmd = run('tmux', 'display-message', '-t', 'gw:' + sub + '.0', '-p', '#{pane_current_command}')
                         if cmd in SHELLS or not cmd:
                             indicator = c('38;5;82', '● idle')
-                            attn_latch.pop(sub, None)
+                            attn_clear(sub)
                         elif waiting_for_input(sub):
                             any_attn = True
                             indicator = c('1;38;5;208', '⚠ input')
-                            if not attn_latch.get(sub):
+                            if attn_mark(sub):
                                 notify(proj, branch, idx, sub)
-                                attn_latch[sub] = True
                         else:
                             any_running = True
                             indicator = c('38;5;226', SPIN[tick % len(SPIN)] + ' running')
-                            attn_latch.pop(sub, None)
+                            attn_clear(sub)
                 out.append('  ' + idx + ' ' + indicator)
 
-    # Drop latches for windows that no longer exist.
-    for k in list(attn_latch):
+    # Drop state for windows that no longer exist.
+    for k in list(attn_state):
         if k not in seen_subs:
-            attn_latch.pop(k, None)
+            attn_state.pop(k, None)
 
     sys.stdout.write('\033[H')
     for l in out:
@@ -479,7 +504,9 @@ while True:
     sys.stdout.flush()
 
     tick += 1
-    time.sleep(0.15 if (any_running or any_attn) else 1.0)
+    # Fast poll only to animate the running spinner. The input indicator is
+    # static, so a waiting pane doesn't need sub-second capture-pane churn.
+    time.sleep(0.15 if any_running else 1.0)
 `
 
 func windowsListScriptPath() string {
