@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -65,9 +66,19 @@ type listItem struct {
 	branch    string // The human-readable branch name
 	display   string // Friendly worktree display name
 	shellPath string
+	frequent  bool // copy shown in the "frequent" section at the top
+	divider   bool // rule closing the frequent section
 }
 
-func buildItems(st State) []listItem {
+const (
+	maxFrequent       = 6
+	minFrequentVisits = 1
+)
+
+// prCache maps project path -> branch -> "#N".
+type prCache map[string]map[string]string
+
+func buildItems(st State, prs prCache) []listItem {
 	var items []listItem
 	for _, p := range st.Projects {
 		items = append(items, listItem{isHeader: true, project: p})
@@ -76,6 +87,7 @@ func buildItems(st State) []listItem {
 			continue
 		}
 		for _, wt := range trees {
+			wt.PRInfo = prs[p.Path][wt.Branch]
 			items = append(items, listItem{
 				project:  p,
 				worktree: wt,
@@ -86,13 +98,87 @@ func buildItems(st State) []listItem {
 		}
 	}
 	if st.LaunchDir != "" {
-		items = append(items, listItem{
+		items = append([]listItem{{
 			isShell:   true,
 			title:     "gw-shell",
 			shellPath: st.LaunchDir,
+		}}, items...)
+	}
+	return withFrequent(items, st)
+}
+
+// withFrequent (re)builds the "frequent" section: the most-visited worktrees by
+// frecency, duplicated from their project sections to the top of the list, below
+// the shell item.
+func withFrequent(items []listItem, st State) []listItem {
+	var shell, base, cands []listItem
+	for _, it := range items {
+		if it.frequent {
+			continue
+		}
+		if it.isShell {
+			shell = append(shell, it)
+			continue
+		}
+		base = append(base, it)
+		if !it.isHeader && !it.isShell && st.Visits[it.title].Count >= minFrequentVisits {
+			cands = append(cands, it)
+		}
+	}
+	if len(cands) == 0 {
+		return append(shell, base...)
+	}
+	now := time.Now()
+	sort.SliceStable(cands, func(i, j int) bool {
+		return st.Visits[cands[i].title].score(now) > st.Visits[cands[j].title].score(now)
+	})
+	if len(cands) > maxFrequent {
+		cands = cands[:maxFrequent]
+	}
+	out := append(shell, listItem{isHeader: true, frequent: true})
+	for _, it := range cands {
+		it.frequent = true
+		out = append(out, it)
+	}
+	out = append(out, listItem{isHeader: true, frequent: true, divider: true})
+	return append(out, base...)
+}
+
+// seedVisits gives every worktree already open in tmux one visit, so the frequent
+// section is useful on first run instead of empty until history builds up.
+func seedVisits(st *State) {
+	for name := range liveWindows() {
+		if strings.HasPrefix(name, "wt-") && !strings.Contains(name, "~") {
+			st.recordVisit(name)
+		}
+	}
+	if st.Visits != nil {
+		saveState(*st)
+	}
+}
+
+type prsLoadedMsg struct {
+	project string
+	prs     map[string]string
+}
+
+// loadPRs fetches PR numbers in the background so the list never waits on gh.
+func loadPRs(projects []Project) tea.Cmd {
+	var cmds []tea.Cmd
+	for _, p := range projects {
+		path := p.Path
+		cmds = append(cmds, func() tea.Msg {
+			trees, _ := listWorktrees(path)
+			var branches []string
+			for _, wt := range trees {
+				if wt.Path != path {
+					branches = append(branches, wt.Branch)
+				}
+			}
+			return prsLoadedMsg{project: path, prs: fetchPRs(path, branches)}
 		})
 	}
-	return items
+	return tea.Batch(cmds...)
 }
 
 // ── Model ─────────────────────────────────────────────────────────────────────
@@ -163,7 +249,9 @@ type sidebarModel struct {
 	width         int
 	height        int
 	windows       map[string]bool
+	prs           prCache
 	ready         bool
+	startItem     int // opened on first resize; the cursor itself starts on frequent
 	pending       pendingKind
 	pendingItem   listItem
 	prContent     string
@@ -198,7 +286,10 @@ func newSidebarModel() sidebarModel {
 	si.CharLimit = 100
 
 	st := loadState()
-	items := buildItems(st)
+	if st.Visits == nil {
+		seedVisits(&st)
+	}
+	items := buildItems(st, nil)
 
 	cursor := 0
 	if st.LaunchedFromShell {
@@ -231,8 +322,16 @@ func newSidebarModel() sidebarModel {
 		}
 	}
 
+	start := cursor
+	switch {
+	case len(items) > 0 && items[0].isShell:
+		cursor = 0
+	case len(items) > 1 && items[0].frequent && !items[cursor].frequent:
+		cursor = 1
+	}
+
 	now := time.Now()
-	return sidebarModel{items: items, cursor: cursor, input: ti, searchInput: si, state: st, windows: liveWindows(), dogLastKey: now, dogLastBark: now, dogNextLook: now.Add(5 * time.Second)}
+	return sidebarModel{items: items, cursor: cursor, startItem: start, input: ti, searchInput: si, state: st, windows: liveWindows(), prs: prCache{}, dogLastKey: now, dogLastBark: now, dogNextLook: now.Add(5 * time.Second)}
 }
 
 func runSidebar() {
@@ -278,10 +377,42 @@ func (m *sidebarModel) currentItem() *listItem {
 
 func (m *sidebarModel) refresh() {
 	m.state = loadState()
+	m.setItems(buildItems(m.state, m.prs))
+}
+
+// setItems replaces the list, keeping the cursor on the same worktree (and in the
+// same section) when it still exists.
+func (m *sidebarModel) setItems(items []listItem) {
+	var title string
+	var freq, had bool
+	if it := m.currentItem(); it != nil {
+		title, freq, had = it.title, it.frequent, true
+	}
 	oldCursor := m.cursor
-	m.items = buildItems(m.state)
-	if oldCursor < len(m.items) {
-		m.cursor = oldCursor
+	m.items = items
+	if had {
+		fallback := -1
+		for i, it := range m.items {
+			if it.isHeader || it.title != title {
+				continue
+			}
+			if it.frequent == freq {
+				fallback = i
+				break
+			}
+			if fallback < 0 {
+				fallback = i
+			}
+		}
+		if fallback >= 0 {
+			m.cursor = fallback
+			m.ensureCursorVisible()
+			return
+		}
+	}
+	m.cursor = oldCursor
+	if m.cursor >= len(m.items) {
+		m.cursor = max(0, len(m.items)-1)
 	}
 	if m.cursor < len(m.items) && m.items[m.cursor].isHeader {
 		m.nextItem()
@@ -291,7 +422,9 @@ func (m *sidebarModel) refresh() {
 
 // ── bubbletea ─────────────────────────────────────────────────────────────────
 
-func (m sidebarModel) Init() tea.Cmd { return dogTickCmd(800 * time.Millisecond) }
+func (m sidebarModel) Init() tea.Cmd {
+	return tea.Batch(dogTickCmd(800*time.Millisecond), loadPRs(m.state.Projects))
+}
 
 func (m sidebarModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if _, ok := msg.(tea.KeyMsg); ok {
@@ -345,8 +478,8 @@ func (m sidebarModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.height = msg.Height
 		if !m.ready {
 			m.ready = true
-			if it := m.currentItem(); it != nil {
-				return m, m.doSwitch(*it)
+			if m.startItem < len(m.items) && !m.items[m.startItem].isHeader {
+				return m, m.doSwitch(m.items[m.startItem])
 			}
 		}
 	case switchedMsg:
@@ -354,6 +487,19 @@ func (m sidebarModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// made by sub-window commands between switches.
 		m.state = loadState()
 		m.windows = liveWindows()
+		m.setItems(withFrequent(m.items, m.state))
+		return m, nil
+	case prsLoadedMsg:
+		if msg.prs == nil {
+			return m, nil
+		}
+		m.prs[msg.project] = msg.prs
+		for i := range m.items {
+			it := &m.items[i]
+			if !it.isHeader && !it.isShell && it.project.Path == msg.project {
+				it.worktree.PRInfo = msg.prs[it.branch]
+			}
+		}
 		return m, nil
 	case worktreeAdded:
 		if msg.err != nil {
@@ -390,9 +536,9 @@ func (m sidebarModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.state = loadState()
-		m.items = buildItems(m.state)
+		m.items = buildItems(m.state, m.prs)
 		for i, it := range m.items {
-			if !it.isHeader && it.project.Path == msg.path {
+			if !it.isHeader && !it.frequent && it.project.Path == msg.path {
 				m.cursor = i
 				break
 			}
@@ -400,7 +546,8 @@ func (m sidebarModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.view = viewList
 		m.input.Blur()
 		m.inErr = ""
-		return m, nil
+		m.ensureCursorVisible()
+		return m, loadPRs([]Project{{Path: msg.path}})
 	case worktreeRemoved:
 		if msg.err != nil {
 			m.inErr = msg.err.Error()
@@ -413,21 +560,16 @@ func (m sidebarModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if st.ActiveTitle == msg.title {
 			st.ActiveTitle = ""
 		}
+		delete(st.Visits, msg.title)
 		saveState(st)
 		m.state = st
-		// Remove the item from the list.
-		for i, it := range m.items {
-			if !it.isHeader && !it.isShell && it.title == msg.title {
-				m.items = append(m.items[:i], m.items[i+1:]...)
-				if m.cursor >= len(m.items) {
-					m.cursor = len(m.items) - 1
-				}
-				break
+		var kept []listItem
+		for _, it := range m.items {
+			if it.isHeader || it.isShell || it.title != msg.title {
+				kept = append(kept, it)
 			}
 		}
-		if m.cursor < len(m.items) && m.items[m.cursor].isHeader {
-			m.nextItem()
-		}
+		m.setItems(withFrequent(kept, st))
 		m.windows = liveWindows()
 		if msg.wasActive {
 			if it := m.currentItem(); it != nil {
@@ -554,6 +696,18 @@ func (m sidebarModel) updateList(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "r":
 			m.refresh()
 			m.windows = liveWindows()
+			return m, loadPRs(m.state.Projects)
+		case "1", "2", "3", "4", "5", "6":
+			n := int(msg.String()[0] - '0')
+			for i, it := range m.items {
+				if it.frequent && !it.isHeader {
+					if n--; n == 0 {
+						m.cursor = i
+						m.ensureCursorVisible()
+						return m, m.doSwitch(it)
+					}
+				}
+			}
 		case "/":
 			m.searching = true
 			m.searchInput.SetValue("")
@@ -590,7 +744,7 @@ func (m *sidebarModel) recomputeSearchMatches() {
 	q := strings.ToLower(m.searchInput.Value())
 	m.searchMatches = nil
 	for i, it := range m.items {
-		if it.isHeader {
+		if it.isHeader || it.frequent {
 			continue
 		}
 		if m.itemMatchesSearch(it, q) {
@@ -828,7 +982,7 @@ func (m sidebarModel) updateConfirm(msg tea.Msg) (tea.Model, tea.Cmd) {
 				st.RemoveProject(proj.Path)
 				saveState(st)
 				m.state = st
-				m.items = buildItems(st)
+				m.items = buildItems(st, m.prs)
 				m.windows = liveWindows()
 				m.view = viewList
 				m.pending = pendingNone
@@ -999,6 +1153,9 @@ func (m sidebarModel) doSwitch(it listItem) tea.Cmd {
 		st := loadState()
 		switchToWindow(from, title, path, st)
 		st.ActiveTitle = title
+		if title != from && !it.isShell {
+			st.recordVisit(title)
+		}
 		saveState(st)
 		updatePreviewTarget(from, st)
 		return switchedMsg{title: title}
@@ -1012,7 +1169,7 @@ func (m sidebarModel) itemLineCount(it listItem) int {
 		return 2
 	}
 	if it.isShell {
-		return 4
+		return 3
 	}
 	if it.branch != "" {
 		return 2
@@ -1057,6 +1214,9 @@ func (m *sidebarModel) ensureCursorVisible() {
 	}
 	curStart := m.cursorLineStart()
 	curEnd := curStart + m.itemLineCount(m.items[m.cursor])
+	if m.cursor > 0 && m.items[m.cursor-1].isHeader {
+		curStart -= m.itemLineCount(m.items[m.cursor-1])
+	}
 	if curEnd > m.listOffset+availH {
 		m.listOffset = curEnd - availH
 	}
@@ -1089,7 +1249,7 @@ func (m sidebarModel) sidebarFooter(w int) string {
 		helpPair("D  rm worktree", "d  rm project", col) + "\n" +
 		helpPair("P  PR details", "C  create PR", col) + "\n" +
 		helpPair("r  refresh", "q  quit", col) + "\n" +
-		helpPair("/  search", "", col) + "\n" +
+		helpPair("/  search", "1-6  frequent", col) + "\n" +
 		div + "\n" +
 		sectionStyle.Render("tmux") + "\n" +
 		helpPair("^a c  new", "^a n  next", col) + "\n" +
@@ -1107,9 +1267,17 @@ func (m sidebarModel) buildListLines(w int) []string {
 	if m.inErr != "" {
 		lines = append(lines, errStyle.Render("! "+truncate(m.inErr, w-3)))
 	}
+	freqN := 0
 	for i, it := range m.items {
+		if it.divider {
+			lines = append(lines, "", dimStyle.Render(strings.Repeat("─", w-1)))
+			continue
+		}
 		if it.isHeader {
 			name := truncate(it.project.Name, w-2)
+			if it.frequent {
+				name = "frequent"
+			}
 			lines = append(lines, "")
 			lines = append(lines, sectionStyle.Render(name))
 			continue
@@ -1131,8 +1299,7 @@ func (m sidebarModel) buildListLines(w int) []string {
 				line = dimStyle.Render("  " + display)
 			}
 			lines = append(lines, "")
-			lines = append(lines, dimStyle.Render(strings.Repeat("─", w-1)))
-			lines = append(lines, dimStyle.Render("shell"))
+			lines = append(lines, sectionStyle.Render("shell"))
 			lines = append(lines, line)
 			continue
 		}
@@ -1146,6 +1313,13 @@ func (m sidebarModel) buildListLines(w int) []string {
 		display := it.display
 		if display == "" {
 			display = friendlyWorktreeName(it.project, it.worktree)
+		}
+		if it.frequent {
+			freqN++
+			if display != it.project.Name {
+				display = it.project.Name + "/" + display
+			}
+			display = fmt.Sprintf("%d %s", freqN, display)
 		}
 		title := truncate(display, w-4-len(marker))
 		var titleLine string

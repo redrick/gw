@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 )
 
 // ── State ─────────────────────────────────────────────────────────────────────
@@ -26,6 +28,36 @@ type State struct {
 	LaunchedFromShell bool              `json:"launched_from_shell,omitempty"`
 	LaunchWorktree    string            `json:"launch_worktree,omitempty"`
 	PinnedPreview     string            `json:"pinned_preview,omitempty"`
+	Visits            map[string]Visit  `json:"visits,omitempty"`
+}
+
+type Visit struct {
+	Count int   `json:"count"`
+	Last  int64 `json:"last"`
+}
+
+// score is frecency: visit count weighted by how recently the worktree was last opened.
+func (v Visit) score(now time.Time) float64 {
+	age := now.Sub(time.Unix(v.Last, 0))
+	switch {
+	case age < 24*time.Hour:
+		return float64(v.Count) * 4
+	case age < 7*24*time.Hour:
+		return float64(v.Count) * 2
+	case age < 30*24*time.Hour:
+		return float64(v.Count)
+	}
+	return float64(v.Count) / 4
+}
+
+func (st *State) recordVisit(title string) {
+	if st.Visits == nil {
+		st.Visits = make(map[string]Visit)
+	}
+	v := st.Visits[title]
+	v.Count++
+	v.Last = time.Now().Unix()
+	st.Visits[title] = v
 }
 
 func statePath() string {
@@ -246,12 +278,37 @@ def capture(target):
     except Exception:
         return ''
 
+# capture-pane is the costly call; re-scrape each pane at most once per ATTN_POLL
+# seconds even while the spinner redraws faster.
+ATTN_POLL = 1.0
+attn_cache = {}
+
 def waiting_for_input(sub, active=False):
     # The active worktree's live pane is swapped into gw:active.1; its storage
     # window gw:<sub>.0 holds the displaced idle shell. Capture the right pane.
     target = 'gw:active.1' if active else 'gw:' + sub + '.0'
+    now = time.monotonic()
+    key = (target, sub)
+    hit = attn_cache.get(key)
+    if hit and now - hit[0] < ATTN_POLL:
+        return hit[1]
     txt = capture(target)
-    return any(p in txt for p in PATTERNS)
+    waiting = any(p in txt for p in PATTERNS)
+    attn_cache[key] = (now, waiting)
+    return waiting
+
+PANE_FMT = '#{window_name}\t#{pane_index}\t#{pane_dead}\t#{pane_current_command}'
+
+def list_panes():
+    # One tmux call per tick: window order plus dead/command for each storage pane.
+    names, panes = [], {}
+    for line in run('tmux', 'list-panes', '-s', '-t', 'gw', '-F', PANE_FMT).splitlines():
+        parts = line.split('\t')
+        if len(parts) != 4 or parts[1] != '0':
+            continue
+        names.append(parts[0])
+        panes[parts[0]] = (parts[2] == '1', parts[3])
+    return names, panes
 
 def _ppid(pid):
     # Parent pid from /proc/<pid>/stat. comm field is parenthesized and may itself
@@ -372,13 +429,19 @@ def notify(proj, branch, idx, sub):
             focus(sub)
     threading.Thread(target=worker, daemon=True).start()
 
+STATE_PATH = os.path.expanduser('~/.config/gw/state.json')
+_state = (None, {})
+
 def load_state():
+    global _state
     try:
-        p = os.path.expanduser('~/.config/gw/state.json')
-        with open(p) as f:
-            return json.load(f)
+        mtime = os.stat(STATE_PATH).st_mtime_ns
+        if mtime != _state[0]:
+            with open(STATE_PATH) as f:
+                _state = (mtime, json.load(f))
     except Exception:
-        return {}
+        pass
+    return _state[1]
 
 def load_projects(state):
     try:
@@ -428,7 +491,7 @@ while True:
     active_title = state.get('active_title', '')
     active_subs = state.get('active_sub') or {}
     active_sub = active_subs.get(active_title, active_title)
-    raw = run('tmux', 'list-windows', '-t', 'gw', '-F', '#{window_name}').splitlines()
+    raw, panes = list_panes()
 
     buckets = {}
     bucket_order = []
@@ -472,12 +535,11 @@ while True:
                     else:
                         attn_clear(sub)
                 else:
-                    dead = run('tmux', 'display-message', '-t', 'gw:' + sub + '.0', '-p', '#{pane_dead}')
-                    if dead == '1':
+                    dead, cmd = panes.get(sub, (False, ''))
+                    if dead:
                         indicator = c('38;5;196', '✕ error')
                         attn_clear(sub)
                     else:
-                        cmd = run('tmux', 'display-message', '-t', 'gw:' + sub + '.0', '-p', '#{pane_current_command}')
                         if cmd in SHELLS or not cmd:
                             indicator = c('38;5;82', '● idle')
                             attn_clear(sub)
@@ -496,6 +558,9 @@ while True:
     for k in list(attn_state):
         if k not in seen_subs:
             attn_state.pop(k, None)
+    for k in list(attn_cache):
+        if k[1] not in seen_subs:
+            attn_cache.pop(k, None)
 
     sys.stdout.write('\033[H')
     for l in out:
@@ -767,15 +832,63 @@ type Worktree struct {
 	PRInfo string
 }
 
-func getPRInfo(path string) string {
-	// Use gh to find if there's an open PR for the current branch.
-	cmd := exec.Command("gh", "pr", "view", "--json", "number", "--template", `#{{.number}}`)
-	cmd.Dir = path
+type prRef struct {
+	Number      int    `json:"number"`
+	HeadRefName string `json:"headRefName"`
+	State       string `json:"state"`
+}
+
+func ghPRList(repoPath string, args ...string) []prRef {
+	cmd := exec.Command("gh", append([]string{"pr", "list", "--state", "all",
+		"--json", "number,headRefName,state"}, args...)...)
+	cmd.Dir = repoPath
 	out, err := cmd.Output()
 	if err != nil {
-		return ""
+		return nil
 	}
-	return strings.TrimSpace(string(out))
+	var prs []prRef
+	json.Unmarshal(out, &prs)
+	return prs
+}
+
+// fetchPRs maps each of branches to "#N", preferring an open PR over closed/merged
+// ones. One batched gh call per repo (a per-worktree `gh pr view` costs ~0.6s each),
+// then a parallel per-branch lookup only for branches older than the batch reaches.
+func fetchPRs(repoPath string, branches []string) map[string]string {
+	result := make(map[string]string)
+	open := make(map[string]bool)
+	add := func(prs []prRef) {
+		for _, pr := range prs {
+			isOpen := pr.State == "OPEN"
+			if _, seen := result[pr.HeadRefName]; seen && (open[pr.HeadRefName] || !isOpen) {
+				continue
+			}
+			result[pr.HeadRefName] = fmt.Sprintf("#%d", pr.Number)
+			open[pr.HeadRefName] = isOpen
+		}
+	}
+	batch := ghPRList(repoPath, "--limit", "300")
+	add(batch)
+	if len(batch) < 300 {
+		return result
+	}
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	for _, b := range branches {
+		if _, ok := result[b]; ok {
+			continue
+		}
+		wg.Add(1)
+		go func(b string) {
+			defer wg.Done()
+			prs := ghPRList(repoPath, "--head", b, "--limit", "20")
+			mu.Lock()
+			add(prs)
+			mu.Unlock()
+		}(b)
+	}
+	wg.Wait()
+	return result
 }
 
 func listWorktrees(repoPath string) ([]Worktree, error) {
@@ -802,7 +915,6 @@ func listWorktrees(repoPath string) ([]Worktree, error) {
 				if cur.Branch == "" {
 					cur.Branch = "(unknown)"
 				}
-				cur.PRInfo = getPRInfo(cur.Path)
 				trees = append(trees, cur)
 				cur = Worktree{}
 			}
@@ -812,7 +924,6 @@ func listWorktrees(repoPath string) ([]Worktree, error) {
 		if cur.Branch == "" {
 			cur.Branch = "(unknown)"
 		}
-		cur.PRInfo = getPRInfo(cur.Path)
 		trees = append(trees, cur)
 	}
 	return trees, sc.Err()
@@ -853,7 +964,9 @@ func activeSubForTitle(st State, baseTitle string) string {
 	return baseTitle
 }
 
-func createSubWindow(baseTitle, path string) (string, error) {
+// createSubWindow opens a new sub-window running command, or a login shell when command is empty
+// (`gw --new-subwindow [command...]`, used by tools such as margin).
+func createSubWindow(baseTitle, path string, command []string) (string, error) {
 	subs := subWindowsForTitle(baseTitle)
 	n := len(subs) + 1
 	newName := fmt.Sprintf("%s~%d", baseTitle, n)
@@ -865,7 +978,11 @@ func createSubWindow(baseTitle, path string) (string, error) {
 	if path != "" {
 		args = append(args, "-c", path)
 	}
-	args = append(args, shellBin(), "-l")
+	if len(command) > 0 {
+		args = append(args, command...)
+	} else {
+		args = append(args, shellBin(), "-l")
+	}
 	if err := exec.Command("tmux", args...).Run(); err != nil {
 		return "", err
 	}
@@ -894,6 +1011,9 @@ func updateStatusBar(baseTitle, activeSub string) {
 
 func getWorktreePath(st State, baseTitle string) string {
 	for _, p := range st.Projects {
+		if !strings.HasPrefix(baseTitle, "wt-"+p.Name+"-") {
+			continue
+		}
 		trees, err := listWorktrees(p.Path)
 		if err != nil {
 			continue

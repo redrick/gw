@@ -45,6 +45,10 @@ gw opens a tmux session with a 40-column sidebar on the left and the active work
 
 With `gh` installed and authenticated, gw checks GitHub for open pull requests on each branch and shows the PR number beside the branch name.
 
+The PR numbers load in the background, so the list is usable immediately and the numbers appear a moment later.
+
+The worktrees you open most often (weighted by how recently you opened them) are pinned in a **frequent** section at the top of the sidebar; press `1`–`6` to jump straight to one.
+
 If you re-run `gw` while a session is already open, it re-attaches to it.
 
 ## Keys
@@ -61,6 +65,7 @@ If you re-run `gw` while a session is already open, it re-attaches to it.
 | `d` | remove project from tracking |
 | `P` | open PR details for the current branch |
 | `C` | create a PR for the current branch |
+| `1`–`6` | open a worktree from the frequent section |
 | `/` | search worktrees |
 | `↑↓` (in search) | cycle matches |
 | `r` | refresh worktree list |

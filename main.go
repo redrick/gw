@@ -165,7 +165,7 @@ func runNewSubwindow() {
 	path := getWorktreePath(st, baseTitle)
 	currentSub := activeSubForTitle(st, baseTitle)
 
-	newSub, err := createSubWindow(baseTitle, path)
+	newSub, err := createSubWindow(baseTitle, path, os.Args[2:])
 	if err != nil {
 		return
 	}
@@ -345,6 +345,8 @@ func runHandlePaneDead() {
 	if path != "" {
 		respawnArgs = append(respawnArgs, "-c", path)
 	}
+	// Respawn as a shell: a sub-window started with a command must not rerun it just to be closed.
+	respawnArgs = append(respawnArgs, shellBin(), "-l")
 	exec.Command("tmux", respawnArgs...).Run()
 
 	if tmuxWindowExists(currentSub) {
