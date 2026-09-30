@@ -711,14 +711,121 @@ func ensureStorageWindow(winName, path string) {
 	if tmuxWindowExists(winName) {
 		return
 	}
-	args := []string{"new-window", "-d", "-t", "gw", "-n", winName}
+	if newStorageWindow(winName, path, nil) == nil {
+		tagPane("gw:"+winName+".0", winName)
+	}
+}
+
+func newStorageWindow(winName, path string, command []string) error {
+	args := []string{"new-window", "-d", "-t", "gw:", "-n", winName}
 	if path != "" {
 		args = append(args, "-c", path)
 	}
-	args = append(args, shellBin(), "-l")
-	exec.Command("tmux", args...).Run()
+	if len(command) > 0 {
+		args = append(args, command...)
+	} else {
+		args = append(args, shellBin(), "-l")
+	}
+	if err := exec.Command("tmux", args...).Run(); err != nil {
+		return err
+	}
 	exec.Command("tmux", "set-option", "-t", "gw:"+winName, "automatic-rename", "off").Run()
 	exec.Command("tmux", "set-option", "-t", "gw:"+winName, "allow-rename", "off").Run()
+	return nil
+}
+
+// Every worktree pane carries @gw_sub, the storage window it belongs to. The spare
+// shell that fills the storage window of the pane on show has no tag. Panes are
+// parked and fetched by tag, never by ActiveSub or window position: a storage
+// window vanishing (its spare shell exited) or stale state used to swap panes into
+// the wrong worktree's window.
+
+func paneTag(target string) string {
+	out, _ := exec.Command("tmux", "display-message", "-p", "-t", target, "#{@gw_sub}").Output()
+	return strings.TrimSpace(string(out))
+}
+
+func tagPane(target, sub string) {
+	exec.Command("tmux", "set-option", "-p", "-t", target, "@gw_sub", sub).Run()
+}
+
+func findPane(sub string) string {
+	out, err := exec.Command("tmux", "list-panes", "-s", "-t", "gw",
+		"-F", "#{pane_id} #{@gw_sub}").Output()
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		if id, tag, ok := strings.Cut(line, " "); ok && tag == sub {
+			return id
+		}
+	}
+	return ""
+}
+
+// parkActive returns the shown pane to its storage window; the spare shell held
+// there moves into the slot.
+func parkActive() {
+	sub := paneTag("gw:active.1")
+	if sub == "" {
+		return
+	}
+	if !tmuxWindowExists(sub) {
+		newStorageWindow(sub, "", nil)
+	}
+	exec.Command("tmux", "swap-pane", "-s", "gw:active.1", "-t", "gw:"+sub+".0").Run()
+}
+
+// showSub parks the shown pane and brings sub's pane into the slot.
+func showSub(sub, path string) {
+	if paneTag("gw:active.1") == sub {
+		return
+	}
+	parkActive()
+	id := findPane(sub)
+	if id == "" {
+		return
+	}
+	if isPaneDead(id) {
+		args := []string{"respawn-pane", "-k", "-t", id}
+		if path != "" {
+			args = append(args, "-c", path)
+		}
+		exec.Command("tmux", args...).Run()
+	}
+	resizeWindowToActive(id)
+	exec.Command("tmux", "swap-pane", "-s", "gw:active.1", "-t", id).Run()
+}
+
+// adoptPanes tags panes of a session started by a gw without tagging: a storage
+// window's pane is its own, except in the shown sub's window, which holds the
+// spare shell while the sub's pane is in the slot.
+func adoptPanes(st State) {
+	shown := ""
+	if st.ActiveTitle != "" {
+		shown = activeSubForTitle(st, st.ActiveTitle)
+	}
+	out, err := exec.Command("tmux", "list-panes", "-s", "-t", "gw",
+		"-F", "#{window_name}\t#{pane_index}\t#{pane_id}\t#{@gw_sub}").Output()
+	if err != nil {
+		return
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		f := strings.Split(line, "\t")
+		if len(f) != 4 || f[3] != "" {
+			continue
+		}
+		win, idx, id := f[0], f[1], f[2]
+		switch {
+		case win == "active" && idx == "1":
+			if shown != "" && shown != "gw-shell" {
+				tagPane(id, shown)
+			}
+		case win == shown:
+		case idx == "0" && (strings.HasPrefix(win, "wt-") || strings.HasPrefix(win, "gw-shell~")):
+			tagPane(id, win)
+		}
+	}
 }
 
 func liveWindows() map[string]bool {
@@ -739,7 +846,7 @@ func liveWindows() map[string]bool {
 // resizeWindowToActive pre-resizes a storage window to match gw:active.1's
 // current dimensions so that swapping the pane in causes no terminal resize
 // and therefore no SIGWINCH to the running process.
-func resizeWindowToActive(winName string) {
+func resizeWindowToActive(target string) {
 	w, err := exec.Command("tmux", "display-message", "-t", "gw:active.1", "-p", "#{pane_width}").Output()
 	if err != nil {
 		return
@@ -753,7 +860,7 @@ func resizeWindowToActive(winName string) {
 	if width == "" || height == "" {
 		return
 	}
-	exec.Command("tmux", "resize-window", "-t", "gw:"+winName, "-x", width, "-y", height).Run()
+	exec.Command("tmux", "resize-window", "-t", target, "-x", width, "-y", height).Run()
 }
 
 func isPaneDead(target string) bool {
@@ -762,64 +869,22 @@ func isPaneDead(target string) bool {
 	return strings.TrimSpace(string(out)) == "1"
 }
 
-// switchToWindow moves the current active pane back to its storage window and
-// brings the target pane into the active right slot — all server-side.
-//
-// The shell item ("gw-shell") has no storage window of its own. The original
-// split-shell acts as a displaced dummy that bounces through worktree storage
-// slots. Switching *to* shell just returns the current worktree to its slot,
-// which naturally surfaces the displaced shell in active.1. Switching *from*
-// shell skips the "return to storage" step (nothing to return).
-func switchToWindow(fromTitle, toTitle, toPath string, st State) {
-	isShellTitle := func(t string) bool { return t == "gw-shell" }
-
-	if isShellTitle(toTitle) {
-		// Return current worktree to storage; displaced shell surfaces in active.1.
-		if fromTitle != "" && !isShellTitle(fromTitle) {
-			fromSub := activeSubForTitle(st, fromTitle)
-			if tmuxWindowExists(fromSub) {
-				exec.Command("tmux", "swap-pane",
-					"-s", "gw:active.1",
-					"-t", "gw:"+fromSub+".0").Run()
-			}
-		}
+// switchToWindow parks the shown pane in its storage window and brings the
+// target's active sub-window into the slot — all server-side. The shell item has
+// no storage window of its own: showing it leaves the spare shell in the slot,
+// unless a sub-window was opened on it.
+func switchToWindow(toTitle, toPath string, st State) {
+	toSub := activeSubForTitle(st, toTitle)
+	if toTitle == "gw-shell" && toSub == toTitle {
+		parkActive()
 		exec.Command("tmux", "select-pane", "-t", "gw:active.1", "-T", "").Run()
 		exec.Command("tmux", "select-pane", "-t", "gw:active.1").Run()
 		return
 	}
-
-	ensureStorageWindow(toTitle, toPath)
-
-	toSub := activeSubForTitle(st, toTitle)
-	if !tmuxWindowExists(toSub) {
-		toSub = toTitle
+	if toTitle != "gw-shell" {
+		ensureStorageWindow(toTitle, toPath)
 	}
-
-	if isPaneDead("gw:" + toSub + ".0") {
-		exec.Command("tmux", "respawn-pane", "-k",
-			"-c", toPath,
-			"-t", "gw:"+toSub+".0").Run()
-	}
-
-	// Return current worktree to its storage (skip when coming from shell —
-	// shell has no storage window).
-	if fromTitle != "" && !isShellTitle(fromTitle) {
-		fromSub := activeSubForTitle(st, fromTitle)
-		if tmuxWindowExists(fromSub) {
-			exec.Command("tmux", "swap-pane",
-				"-s", "gw:active.1",
-				"-t", "gw:"+fromSub+".0").Run()
-		}
-	}
-
-	// Match storage window size to active.1 before swapping in — prevents SIGWINCH.
-	resizeWindowToActive(toSub)
-
-	// Bring target pane into active.1.
-	exec.Command("tmux", "swap-pane",
-		"-s", "gw:active.1",
-		"-t", "gw:"+toSub+".0").Run()
-
+	showSub(toSub, toPath)
 	updateStatusBar(toTitle, toSub)
 	exec.Command("tmux", "select-pane", "-t", "gw:active.1").Run()
 }
@@ -974,20 +1039,10 @@ func createSubWindow(baseTitle, path string, command []string) (string, error) {
 		n++
 		newName = fmt.Sprintf("%s~%d", baseTitle, n)
 	}
-	args := []string{"new-window", "-d", "-t", "gw", "-n", newName}
-	if path != "" {
-		args = append(args, "-c", path)
-	}
-	if len(command) > 0 {
-		args = append(args, command...)
-	} else {
-		args = append(args, shellBin(), "-l")
-	}
-	if err := exec.Command("tmux", args...).Run(); err != nil {
+	if err := newStorageWindow(newName, path, command); err != nil {
 		return "", err
 	}
-	exec.Command("tmux", "set-option", "-t", "gw:"+newName, "automatic-rename", "off").Run()
-	exec.Command("tmux", "set-option", "-t", "gw:"+newName, "allow-rename", "off").Run()
+	tagPane("gw:"+newName+".0", newName)
 	return newName, nil
 }
 
@@ -1045,13 +1100,7 @@ func removeWorktree(projectPath, wtPath, title string, isActive bool, st State) 
 	}
 
 	if isActive {
-		// Swap the pane back to its storage window before we kill it.
-		activeSub := activeSubForTitle(st, title)
-		if tmuxWindowExists(activeSub) {
-			exec.Command("tmux", "swap-pane",
-				"-s", "gw:active.1",
-				"-t", "gw:"+activeSub+".0").Run()
-		}
+		parkActive()
 	}
 
 	out, err := exec.Command("git", "-C", projectPath, "worktree", "remove", wtPath).CombinedOutput()

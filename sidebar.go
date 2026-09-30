@@ -286,6 +286,7 @@ func newSidebarModel() sidebarModel {
 	si.CharLimit = 100
 
 	st := loadState()
+	adoptPanes(st)
 	if st.Visits == nil {
 		seedVisits(&st)
 	}
@@ -1151,7 +1152,7 @@ func (m sidebarModel) doSwitch(it listItem) tea.Cmd {
 		// Reload from file so we have the latest ActiveSub written by sub-window
 		// commands (which run as separate processes and don't update m.state).
 		st := loadState()
-		switchToWindow(from, title, path, st)
+		switchToWindow(title, path, st)
 		st.ActiveTitle = title
 		if title != from && !it.isShell {
 			st.recordVisit(title)

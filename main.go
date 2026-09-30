@@ -111,7 +111,7 @@ func setupTmuxSession() {
 	// Keep pane 1 alive even after shell exits (e.g., ^D).
 	exec.Command("tmux", "set-option", "-t", "gw:active.1", "remain-on-exit", "on").Run()
 	// Hook to respawn pane 1 if it dies (fallback if remain-on-exit isn't enough).
-	exec.Command("tmux", "set-hook", "-t", "gw", "pane-dead",
+	exec.Command("tmux", "set-hook", "-t", "gw", "pane-died",
 		"run-shell '"+bin+" --handle-pane-dead'").Run()
 	exec.Command("tmux", "select-pane", "-t", "gw:active.0").Run()
 
@@ -163,92 +163,80 @@ func runNewSubwindow() {
 		return
 	}
 	path := getWorktreePath(st, baseTitle)
-	currentSub := activeSubForTitle(st, baseTitle)
+	if baseTitle == "gw-shell" {
+		path = st.LaunchDir
+	}
 
 	newSub, err := createSubWindow(baseTitle, path, os.Args[2:])
 	if err != nil {
 		return
 	}
 
-	currentWasDead := isPaneDead("gw:active.1")
-
-	if tmuxWindowExists(currentSub) {
-		exec.Command("tmux", "swap-pane",
-			"-s", "gw:active.1",
-			"-t", "gw:"+currentSub+".0").Run()
+	deadSub := ""
+	if isPaneDead("gw:active.1") {
+		deadSub = paneTag("gw:active.1")
 	}
-	exec.Command("tmux", "swap-pane",
-		"-s", "gw:active.1",
-		"-t", "gw:"+newSub+".0").Run()
-
-	// The hanging dead pane was just parked in currentSub's storage — kill it.
-	if currentWasDead && tmuxWindowExists(currentSub) {
-		exec.Command("tmux", "kill-window", "-t", "gw:"+currentSub).Run()
+	showSub(newSub, path)
+	if deadSub != "" {
+		exec.Command("tmux", "kill-window", "-t", "gw:"+deadSub).Run()
 	}
 
+	setActiveSub(&st, baseTitle, newSub)
+}
+
+func setActiveSub(st *State, baseTitle, sub string) {
 	if st.ActiveSub == nil {
 		st.ActiveSub = make(map[string]string)
 	}
-	st.ActiveSub[baseTitle] = newSub
-	saveState(st)
-	updateStatusBar(baseTitle, newSub)
+	if sub == "" {
+		delete(st.ActiveSub, baseTitle)
+	} else {
+		st.ActiveSub[baseTitle] = sub
+	}
+	saveState(*st)
+	updateStatusBar(baseTitle, sub)
 	exec.Command("tmux", "select-pane", "-t", "gw:active.1").Run()
+}
+
+func neighbourSub(subs []string, current string) string {
+	for i, s := range subs {
+		if s == current {
+			if i+1 < len(subs) {
+				return subs[i+1]
+			}
+			if i > 0 {
+				return subs[i-1]
+			}
+			return ""
+		}
+	}
+	for _, s := range subs {
+		if s != current {
+			return s
+		}
+	}
+	return ""
 }
 
 func runCloseSubwindow() {
 	st := loadState()
 	baseTitle := st.ActiveTitle
-	if baseTitle == "" {
+	currentSub := paneTag("gw:active.1")
+	if baseTitle == "" || currentSub == "" {
 		return
 	}
-	currentSub := activeSubForTitle(st, baseTitle)
 	subs := subWindowsForTitle(baseTitle)
-	if len(subs) == 1 {
-		// If the current subwindow is the only one left, closing it should return us to the shell.
-		// We need to swap the shell back from the storage window to active.1 before killing the window.
-		if currentSub != baseTitle {
-			exec.Command("tmux", "swap-pane",
-				"-s", "gw:active.1",
-				"-t", "gw:"+currentSub+".0").Run()
-			exec.Command("tmux", "kill-window", "-t", "gw:"+currentSub).Run()
-
-			if st.ActiveSub != nil {
-				delete(st.ActiveSub, baseTitle)
-			}
-			saveState(st)
-			updateStatusBar(baseTitle, "")
-			exec.Command("tmux", "select-pane", "-t", "gw:active.1").Run()
-		}
+	if len(subs) == 1 && currentSub == baseTitle {
 		return
 	}
+	nextSub := neighbourSub(subs, currentSub)
 
-	var nextSub string
-	for i, s := range subs {
-		if s == currentSub {
-			if i+1 < len(subs) {
-				nextSub = subs[i+1]
-			} else {
-				nextSub = subs[i-1]
-			}
-			break
-		}
-	}
-	if nextSub == "" {
-		nextSub = subs[0]
-	}
-
-	exec.Command("tmux", "swap-pane",
-		"-s", "gw:active.1",
-		"-t", "gw:"+nextSub+".0").Run()
+	parkActive()
 	exec.Command("tmux", "kill-window", "-t", "gw:"+currentSub).Run()
-
-	if st.ActiveSub == nil {
-		st.ActiveSub = make(map[string]string)
+	if nextSub != "" {
+		showSub(nextSub, getWorktreePath(st, baseTitle))
 	}
-	st.ActiveSub[baseTitle] = nextSub
-	saveState(st)
-	updateStatusBar(baseTitle, nextSub)
-	exec.Command("tmux", "select-pane", "-t", "gw:active.1").Run()
+	setActiveSub(&st, baseTitle, nextSub)
 }
 
 func runNavigateSubwindow(dir int) {
@@ -257,37 +245,26 @@ func runNavigateSubwindow(dir int) {
 	if baseTitle == "" {
 		return
 	}
-	currentSub := activeSubForTitle(st, baseTitle)
+	currentSub := paneTag("gw:active.1")
 	subs := subWindowsForTitle(baseTitle)
-	if len(subs) <= 1 {
+	if len(subs) == 0 || (len(subs) == 1 && subs[0] == currentSub) {
 		return
 	}
 
-	currentIdx := 0
+	currentIdx := -1
 	for i, s := range subs {
 		if s == currentSub {
 			currentIdx = i
 			break
 		}
 	}
-	nextIdx := (currentIdx + dir + len(subs)) % len(subs)
-	nextSub := subs[nextIdx]
-
-	exec.Command("tmux", "swap-pane",
-		"-s", "gw:active.1",
-		"-t", "gw:"+currentSub+".0").Run()
-	resizeWindowToActive(nextSub)
-	exec.Command("tmux", "swap-pane",
-		"-s", "gw:active.1",
-		"-t", "gw:"+nextSub+".0").Run()
-
-	if st.ActiveSub == nil {
-		st.ActiveSub = make(map[string]string)
+	nextSub := subs[(currentIdx+dir+len(subs))%len(subs)]
+	if currentIdx < 0 {
+		nextSub = subs[0]
 	}
-	st.ActiveSub[baseTitle] = nextSub
-	saveState(st)
-	updateStatusBar(baseTitle, nextSub)
-	exec.Command("tmux", "select-pane", "-t", "gw:active.1").Run()
+
+	showSub(nextSub, "")
+	setActiveSub(&st, baseTitle, nextSub)
 }
 
 func runNextSubwindow() { runNavigateSubwindow(1) }
@@ -299,72 +276,30 @@ func runHandlePaneDead() {
 	}
 	st := loadState()
 	baseTitle := st.ActiveTitle
-	if baseTitle == "" {
+	currentSub := paneTag("gw:active.1")
+	if baseTitle == "" || currentSub == "" {
 		return
 	}
-	currentSub := activeSubForTitle(st, baseTitle)
 	subs := subWindowsForTitle(baseTitle)
-
-	if len(subs) == 0 {
-		return
-	}
-	if len(subs) == 1 && subs[0] == currentSub {
+	nextSub := neighbourSub(subs, currentSub)
+	if nextSub == "" {
 		// Last sub — leave it hanging so the pane stays visible.
 		return
 	}
 
-	var nextSub string
-	for i, s := range subs {
-		if s == currentSub {
-			if i+1 < len(subs) {
-				nextSub = subs[i+1]
-			} else if i > 0 {
-				nextSub = subs[i-1]
-			}
-			break
-		}
-	}
-	if nextSub == "" {
-		for _, s := range subs {
-			if s != currentSub {
-				nextSub = s
-				break
-			}
-		}
-	}
-	if nextSub == "" {
-		return
-	}
-
-	// Respawn the dead pane before navigating. Swapping a dead pane into a
-	// storage window (which has no remain-on-exit) can cause that window to be
-	// auto-killed, corrupting the sub count and making subsequent pane deaths
-	// incorrectly look like the last sub.
+	// Respawn as a shell before parking: a dead pane in a storage window (no
+	// remain-on-exit) takes its window with it. A shell, so a sub-window started
+	// with a command does not rerun it just to be closed.
 	path := getWorktreePath(st, baseTitle)
 	respawnArgs := []string{"respawn-pane", "-k", "-t", "gw:active.1"}
 	if path != "" {
 		respawnArgs = append(respawnArgs, "-c", path)
 	}
-	// Respawn as a shell: a sub-window started with a command must not rerun it just to be closed.
 	respawnArgs = append(respawnArgs, shellBin(), "-l")
 	exec.Command("tmux", respawnArgs...).Run()
 
-	if tmuxWindowExists(currentSub) {
-		exec.Command("tmux", "swap-pane",
-			"-s", "gw:active.1",
-			"-t", "gw:"+currentSub+".0").Run()
-	}
+	parkActive()
 	exec.Command("tmux", "kill-window", "-t", "gw:"+currentSub).Run()
-
-	exec.Command("tmux", "swap-pane",
-		"-s", "gw:active.1",
-		"-t", "gw:"+nextSub+".0").Run()
-
-	if st.ActiveSub == nil {
-		st.ActiveSub = make(map[string]string)
-	}
-	st.ActiveSub[baseTitle] = nextSub
-	saveState(st)
-	updateStatusBar(baseTitle, nextSub)
-	exec.Command("tmux", "select-pane", "-t", "gw:active.1").Run()
+	showSub(nextSub, path)
+	setActiveSub(&st, baseTitle, nextSub)
 }
