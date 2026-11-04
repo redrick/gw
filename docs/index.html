@@ -248,7 +248,7 @@
         <a class="hide-sm" href="#how">how it works</a>
         <a class="hide-sm" href="#keys">keys</a>
         <a href="#install">install</a>
-        <a href="https://github.com/redrick/gw">github ↗</a>
+        <a href="https://github.com/matterpale/gw">github ↗</a>
         <button class="theme" type="button" aria-label="Toggle colour theme" title="Toggle theme">◐</button>
       </nav>
     </div>
@@ -262,10 +262,10 @@
         <p class="lede">gw puts a sidebar of your git worktrees inside tmux. Switching swaps panes on the tmux server, so each worktree keeps its shell, editor, dev server and coding agent alive in the background.</p>
         <div class="cta">
           <div class="install">
-            <span class="p">$</span><code id="cmd">go install github.com/redrick/gw@latest</code>
-            <button class="copy" type="button" data-copy="go install github.com/redrick/gw@latest">copy</button>
+            <span class="p">$</span><code id="cmd">go install github.com/matterpale/gw@latest</code>
+            <button class="copy" type="button" data-copy="go install github.com/matterpale/gw@latest">copy</button>
           </div>
-          <a class="btn" href="https://github.com/redrick/gw">★ source on GitHub</a>
+          <a class="btn" href="https://github.com/matterpale/gw">★ source on GitHub</a>
         </div>
 
         <div class="stage">
@@ -443,10 +443,10 @@
         <div class="inst">
           <div>
 <pre class="code"><span class="d"># with Go 1.24+</span>
-<span class="p">$ </span>go install github.com/redrick/gw@latest
+<span class="p">$ </span>go install github.com/matterpale/gw@latest
 
 <span class="d"># or from source</span>
-<span class="p">$ </span>git clone https://github.com/redrick/gw
+<span class="p">$ </span>git clone https://github.com/matterpale/gw
 <span class="p">$ </span>cd gw &amp;&amp; make install
 
 <span class="p">$ </span>gw</pre>
@@ -455,10 +455,11 @@
             <ul class="req">
               <li><code>tmux</code><span>the session gw runs in</span></li>
               <li><code>git</code><span>worktrees, branches, remotes</span></li>
+              <li><code>python3</code><span>the activity list and the system monitor</span></li>
               <li><code>gh</code><span>PR badges, details and creation (authenticate with <code>gh auth login</code>)</span></li>
-              <li><code>notify-send</code><span>optional: desktop notifications when an agent waits for input</span></li>
+              <li><code>notify-send</code> or <code>terminal-notifier</code><span>optional: desktop notifications on Linux or macOS when an agent waits for input</span></li>
             </ul>
-            <p class="note">Notifications target Linux with a freedesktop daemon. Raising the terminal when a notification is clicked works on X11 only. The sidebar's ⚠ indicator works everywhere. State lives in <code>~/.config/gw/state.json</code>.</p>
+            <p class="note">On Linux, notifications need a freedesktop daemon, and raising the terminal on click works on X11 only. On macOS, gw uses <code>terminal-notifier</code> if it is installed, and iTerm2 notifications if it is not. The ⚠ indicator works on Linux and macOS. State is in <code>~/.config/gw/state.json</code>.</p>
           </div>
         </div>
       </div>
@@ -468,7 +469,7 @@
   <footer>
     <div class="wrap">
       <span>gw · MIT licence · made by <a href="https://antas.cz/">Andrej Antaš</a></span>
-      <a href="https://github.com/redrick/gw">github.com/redrick/gw</a>
+      <a href="https://github.com/matterpale/gw">github.com/matterpale/gw</a>
     </div>
   </footer>
 

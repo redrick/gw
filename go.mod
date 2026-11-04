@@ -1,4 +1,4 @@
-module github.com/redrick/gw
+module github.com/matterpale/gw
 
 go 1.24.9
 

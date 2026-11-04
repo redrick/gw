@@ -268,6 +268,8 @@ type sidebarModel struct {
 	searchInput   textinput.Model
 	searchMatches []int
 	searchCursor  int
+	showHelp      bool // full help in a window too short to show it by default
+	cfg           Config
 	// viewCreate step 2: base branch picker for new branches
 	createStep          int    // 0 = typing name, 1 = picking base
 	createBranch        string // branch name confirmed in step 0
@@ -331,8 +333,14 @@ func newSidebarModel() sidebarModel {
 		cursor = 1
 	}
 
+	cfg, err := loadConfig()
+	inErr := ""
+	if err != nil {
+		inErr = err.Error()
+	}
+
 	now := time.Now()
-	return sidebarModel{items: items, cursor: cursor, startItem: start, input: ti, searchInput: si, state: st, windows: liveWindows(), prs: prCache{}, dogLastKey: now, dogLastBark: now, dogNextLook: now.Add(5 * time.Second)}
+	return sidebarModel{items: items, cursor: cursor, startItem: start, input: ti, searchInput: si, state: st, windows: liveWindows(), prs: prCache{}, dogLastKey: now, dogLastBark: now, dogNextLook: now.Add(5 * time.Second), cfg: cfg, inErr: inErr}
 }
 
 func runSidebar() {
@@ -635,23 +643,25 @@ func (m sidebarModel) updateList(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
 		m.inErr = ""
-		switch msg.String() {
-		case "ctrl+c", "q":
+		km := m.cfg.Keys.Sidebar
+		key := msg.String()
+		switch {
+		case km.Quit.Has(key):
 			return m, tea.Quit
-		case "up", "k":
+		case km.MoveUp.Has(key):
 			m.prevItem()
-		case "down", "j":
+		case km.MoveDown.Has(key):
 			m.nextItem()
-		case "enter", " ", "o":
+		case km.Open.Has(key):
 			if it := m.currentItem(); it != nil {
 				return m, m.doSwitch(*it)
 			}
-		case "P":
+		case km.PRDetails.Has(key):
 			if it := m.currentItem(); it != nil && !it.isShell && it.worktree.PRInfo != "" {
 				path := it.worktree.Path
 				return m, openPRPopup(path)
 			}
-		case "C":
+		case km.CreatePR.Has(key):
 			if it := m.currentItem(); it != nil && !it.isShell {
 				if it.worktree.PRInfo != "" {
 					m.inErr = "PR already exists: " + it.worktree.PRInfo
@@ -660,7 +670,7 @@ func (m sidebarModel) updateList(msg tea.Msg) (tea.Model, tea.Cmd) {
 				path := it.worktree.Path
 				return m, openCreatePRPopup(path)
 			}
-		case "n":
+		case km.NewWorktree.Has(key):
 			if it := m.currentItem(); it != nil && !it.isShell {
 				m.view = viewCreate
 				m.inErr = ""
@@ -669,14 +679,14 @@ func (m sidebarModel) updateList(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.input.Focus()
 				return m, textinput.Blink
 			}
-		case "a":
+		case km.AddProject.Has(key):
 			m.view = viewAddProject
 			m.inErr = ""
 			m.input.SetValue("")
 			m.input.Placeholder = "/path/to/repo"
 			m.input.Focus()
 			return m, textinput.Blink
-		case "D":
+		case km.RemoveWorktree.Has(key):
 			if it := m.currentItem(); it != nil && !it.isShell {
 				if it.worktree.Path == it.project.Path {
 					m.inErr = "cannot remove main worktree"
@@ -687,19 +697,19 @@ func (m sidebarModel) updateList(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.view = viewConfirm
 				return m, nil
 			}
-		case "d":
+		case km.RemoveProject.Has(key):
 			if it := m.currentItem(); it != nil && !it.isShell {
 				m.pending = pendingRemoveProject
 				m.pendingItem = *it
 				m.view = viewConfirm
 				return m, nil
 			}
-		case "r":
+		case km.Refresh.Has(key):
 			m.refresh()
 			m.windows = liveWindows()
 			return m, loadPRs(m.state.Projects)
-		case "1", "2", "3", "4", "5", "6":
-			n := int(msg.String()[0] - '0')
+		case len(key) == 1 && key >= "1" && key <= "6":
+			n := int(key[0] - '0')
 			for i, it := range m.items {
 				if it.frequent && !it.isHeader {
 					if n--; n == 0 {
@@ -709,7 +719,7 @@ func (m sidebarModel) updateList(msg tea.Msg) (tea.Model, tea.Cmd) {
 					}
 				}
 			}
-		case "/":
+		case km.Search.Has(key):
 			m.searching = true
 			m.searchInput.SetValue("")
 			m.searchCursor = 0
@@ -717,6 +727,9 @@ func (m sidebarModel) updateList(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.listOffset = 0
 			m.recomputeSearchMatches()
 			return m, textinput.Blink
+		case km.Help.Has(key):
+			m.showHelp = !m.showHelp
+			m.ensureCursorVisible()
 		}
 	}
 	return m, nil
@@ -1178,14 +1191,24 @@ func (m sidebarModel) itemLineCount(it listItem) int {
 	return 1
 }
 
+// errLines wraps the error to the sidebar width, so that its end stays readable:
+// a config error ends with the misspelled name.
+func (m sidebarModel) errLines() []string {
+	if m.inErr == "" {
+		return nil
+	}
+	w := m.width
+	if w < 10 {
+		w = 30
+	}
+	return wrapLines("! "+m.inErr, w-1)
+}
+
 func (m sidebarModel) cursorLineStart() int {
 	if m.cursor >= len(m.items) {
 		return 0
 	}
-	off := 0
-	if m.inErr != "" {
-		off++
-	}
+	off := len(m.errLines())
 	for i, it := range m.items {
 		if i == m.cursor {
 			return off
@@ -1229,12 +1252,22 @@ func (m *sidebarModel) ensureCursorVisible() {
 	}
 }
 
+// shortWindow reports a window too short for the dog and the full help: together
+// they take 19 rows, and the worktree list must come first.
+func (m sidebarModel) shortWindow() bool {
+	return m.height > 0 && m.height < 32
+}
+
 func (m sidebarModel) sidebarTop(w int) string {
 	label := sectionStyle.Render("worktrees")
 	if m.searching {
 		label = activeStyle.Render("/") + " " + m.searchInput.View()
 	}
-	return m.dogView() + "\n" +
+	dog := ""
+	if !m.shortWindow() {
+		dog = m.dogView() + "\n"
+	}
+	return dog +
 		dimStyle.Render(strings.Repeat("─", w-1)) + "\n" +
 		label + "\n" +
 		dimStyle.Render(strings.Repeat("─", w-1)) + "\n"
@@ -1243,19 +1276,25 @@ func (m sidebarModel) sidebarTop(w int) string {
 func (m sidebarModel) sidebarFooter(w int) string {
 	col := (w - 2) / 2
 	div := dimStyle.Render(strings.Repeat("─", w-1))
+	km := m.cfg.Keys.Sidebar
+	if m.shortWindow() && !m.showHelp {
+		return div + "\n" + helpStyle.Render(truncate(km.Help.Label()+" help   "+km.Quit.Label()+" quit", w-1))
+	}
+	tk := m.cfg.Tmux.PrefixBindings
+	prefix := Keys{m.cfg.Tmux.Prefix}.Label() + " "
 	return div + "\n" +
 		sectionStyle.Render("gw") + "\n" +
-		helpPair("↑↓ / k j  move", "enter / o  open", col) + "\n" +
-		helpPair("n  new worktree", "a  add project", col) + "\n" +
-		helpPair("D  rm worktree", "d  rm project", col) + "\n" +
-		helpPair("P  PR details", "C  create PR", col) + "\n" +
-		helpPair("r  refresh", "q  quit", col) + "\n" +
-		helpPair("/  search", "1-6  frequent", col) + "\n" +
+		helpPair(km.MoveUp.Label()+km.MoveDown.Label()+"  move", km.Open.Label()+"  open", col) + "\n" +
+		helpPair(km.NewWorktree.Label()+"  new worktree", km.AddProject.Label()+"  add project", col) + "\n" +
+		helpPair(km.RemoveWorktree.Label()+"  rm worktree", km.RemoveProject.Label()+"  rm project", col) + "\n" +
+		helpPair(km.PRDetails.Label()+"  PR details", km.CreatePR.Label()+"  create PR", col) + "\n" +
+		helpPair(km.Refresh.Label()+"  refresh", km.Quit.Label()+"  quit", col) + "\n" +
+		helpPair(km.Search.Label()+"  search", "1-6  frequent", col) + "\n" +
 		div + "\n" +
 		sectionStyle.Render("tmux") + "\n" +
-		helpPair("^a c  new", "^a n  next", col) + "\n" +
-		helpPair("^a p  prev", "^a s  sidebar", col) + "\n" +
-		helpPair("^a b  attach preview", "^a [  scroll mode", col)
+		helpPair(prefix+tk.NewTab.Label()+"  new", prefix+tk.NextTab.Label()+"  next", col) + "\n" +
+		helpPair(prefix+tk.PreviousTab.Label()+"  prev", prefix+tk.FocusSidebar.Label()+"  sidebar", col) + "\n" +
+		helpPair(prefix+"b  attach preview", prefix+"[  scroll mode", col)
 }
 
 func helpPair(left, right string, colW int) string {
@@ -1265,8 +1304,8 @@ func helpPair(left, right string, colW int) string {
 
 func (m sidebarModel) buildListLines(w int) []string {
 	var lines []string
-	if m.inErr != "" {
-		lines = append(lines, errStyle.Render("! "+truncate(m.inErr, w-3)))
+	for _, l := range m.errLines() {
+		lines = append(lines, errStyle.Render(l))
 	}
 	freqN := 0
 	for i, it := range m.items {
@@ -1660,6 +1699,7 @@ type prDetailsModel struct {
 	editIdx  int
 	editor   textarea.Model
 	viewport viewport.Model
+	keys     PRDetailsKeys
 }
 
 type prDetailsLoadedMsg struct {
@@ -1676,7 +1716,8 @@ func runPRDetails(path string) {
 	ta.Placeholder = "Write a PR comment…"
 	ta.ShowLineNumbers = false
 	ta.Focus()
-	p := tea.NewProgram(prDetailsModel{path: path, loading: true, editor: ta}, tea.WithAltScreen())
+	cfg, _ := loadConfig()
+	p := tea.NewProgram(prDetailsModel{path: path, loading: true, editor: ta, keys: cfg.Keys.PRDetails}, tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintln(os.Stderr, "gw pr:", err)
 	}
@@ -1695,13 +1736,7 @@ func (m prDetailsModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.viewport.SetContent(m.currentPRBody())
 	case tea.KeyMsg:
 		if m.editing != prEditNone {
-			switch msg.String() {
-			case "ctrl+c", "esc":
-				m.editing = prEditNone
-				m.status = "edit cancelled"
-				m.viewport.SetContent(m.currentPRBody())
-				return m, nil
-			case "ctrl+s":
+			if m.keys.Save.Has(msg.String()) {
 				body := strings.TrimSpace(m.editor.Value())
 				if body == "" {
 					m.status = "body cannot be empty"
@@ -1710,24 +1745,32 @@ func (m prDetailsModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.loading = true
 				return m, savePRText(m.path, m.pr.ID, m.editing, m.editIdx, m.commentID(m.editIdx), body)
 			}
+			switch msg.String() {
+			case "ctrl+c", "esc":
+				m.editing = prEditNone
+				m.status = "edit cancelled"
+				m.viewport.SetContent(m.currentPRBody())
+				return m, nil
+			}
 			var cmd tea.Cmd
 			m.editor, cmd = m.editor.Update(msg)
 			return m, cmd
 		}
-		switch msg.String() {
-		case "ctrl+c", "esc", "q":
+		key := msg.String()
+		switch {
+		case m.keys.Close.Has(key):
 			return m, tea.Quit
-		case "tab", "right", "l", "shift+tab", "left", "h":
+		case m.keys.SwitchTab.Has(key):
 			m.tab = (m.tab + 1) % 2
 			m.viewport.GotoTop()
 			m.viewport.SetContent(m.currentPRBody())
 			return m, nil
-		case "c":
+		case m.keys.NewComment.Has(key):
 			if m.tab == 0 && !m.loading && m.err == "" {
 				m.startEdit(prEditNewComment, -1, "")
 				return m, nil
 			}
-		case "e":
+		case m.keys.Edit.Has(key):
 			if m.tab == 0 && !m.loading && m.err == "" {
 				if m.selected == 0 {
 					m.startEdit(prEditDescription, 0, m.pr.Body)
@@ -1736,13 +1779,13 @@ func (m prDetailsModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				return m, nil
 			}
-		case "n":
+		case m.keys.NextComment.Has(key):
 			if m.tab == 0 && m.selected < len(m.pr.Comments) {
 				m.selected++
 				m.viewport.SetContent(m.currentPRBody())
 				return m, nil
 			}
-		case "p":
+		case m.keys.PrevComment.Has(key):
 			if m.tab == 0 && m.selected > 0 {
 				m.selected--
 				m.viewport.SetContent(m.currentPRBody())
@@ -1800,7 +1843,7 @@ func (m prDetailsModel) View() string {
 		w = 100
 	}
 	if m.editing != prEditNone {
-		return m.prHeader(w) + "\n" + m.editTitle() + "\n" + m.editor.View() + "\n" + helpStyle.Render("ctrl+s save   esc cancel")
+		return m.prHeader(w) + "\n" + m.editTitle() + "\n" + m.editor.View() + "\n" + helpStyle.Render(m.keys.Save.Label()+" save   esc cancel")
 	}
 	return m.prHeader(w) + "\n" + m.viewport.View() + "\n" + m.prFooter(w)
 }
@@ -1827,7 +1870,7 @@ func (m prDetailsModel) prHeader(w int) string {
 		status = dimStyle.Render("  " + m.status)
 	}
 	return lipgloss.NewStyle().Padding(0, 1).Render(sectionStyle.Render("Pull request")+tool+status) + "\n" +
-		lipgloss.NewStyle().Padding(0, 1).Render(m.tabLabel(0, "Conversation")+"  "+m.tabLabel(1, "Files changed")+dimStyle.Render("   tab/←/→ switch"))
+		lipgloss.NewStyle().Padding(0, 1).Render(m.tabLabel(0, "Conversation")+"  "+m.tabLabel(1, "Files changed")+dimStyle.Render("   "+m.keys.SwitchTab.Label()+" switch"))
 }
 
 func (m prDetailsModel) tabLabel(tab int, label string) string {
@@ -1839,7 +1882,7 @@ func (m prDetailsModel) tabLabel(tab int, label string) string {
 
 func (m prDetailsModel) prFooter(w int) string {
 	pos := fmt.Sprintf("%d%%", int(m.viewport.ScrollPercent()*100))
-	return helpStyle.Render("↑/↓ j/k pgup/pgdn scroll   n/p select   c comment   e edit selected   q/esc close   " + pos)
+	return helpStyle.Render("↑/↓ j/k pgup/pgdn scroll   " + m.keys.NextComment.Label() + "/" + m.keys.PrevComment.Label() + " select   " + m.keys.NewComment.Label() + " comment   " + m.keys.Edit.Label() + " edit selected   " + m.keys.Close.Label() + " close   " + pos)
 }
 
 func (m prDetailsModel) currentPRBody() string {
@@ -2241,6 +2284,7 @@ type createPRModel struct {
 	title    textinput.Model
 	body     textarea.Model
 	preview  viewport.Model
+	keys     CreatePRKeys
 }
 
 type createPRLoadedMsg struct {
@@ -2260,7 +2304,8 @@ func runCreatePR(path string) {
 	ta.Placeholder = "PR description"
 	ta.ShowLineNumbers = false
 	ta.CharLimit = 20000
-	m := createPRModel{path: path, loading: true, title: ti, body: ta}
+	cfg, _ := loadConfig()
+	m := createPRModel{path: path, loading: true, title: ti, body: ta, keys: cfg.Keys.CreatePR}
 	p := tea.NewProgram(m, tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintln(os.Stderr, "gw create-pr:", err)
@@ -2306,11 +2351,25 @@ func (m createPRModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		}
-		switch msg.String() {
-		case "ctrl+c", "esc":
+		if m.keys.Create.Has(msg.String()) {
+			if m.loading || m.creating {
+				return m, nil
+			}
+			title := strings.TrimSpace(m.title.Value())
+			body := strings.TrimSpace(m.body.Value())
+			if title == "" {
+				m.err = "title cannot be empty"
+				return m, nil
+			}
+			m.creating = true
+			return m, createPRCmd(m.path, m.draft.Base, m.draft.Head, title, body)
+		}
+		key := msg.String()
+		switch {
+		case key == "ctrl+c" || key == "esc":
 			return m, tea.Quit
-		case "tab", "shift+tab":
-			if msg.String() == "shift+tab" {
+		case m.keys.NextField.Has(key) || m.keys.PrevField.Has(key):
+			if m.keys.PrevField.Has(key) {
 				m.focus = (m.focus + 2) % 3
 			} else {
 				m.focus = (m.focus + 1) % 3
@@ -2324,18 +2383,6 @@ func (m createPRModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.preview.SetContent(m.previewText())
 			return m, nil
-		case "ctrl+s":
-			if m.loading || m.creating {
-				return m, nil
-			}
-			title := strings.TrimSpace(m.title.Value())
-			body := strings.TrimSpace(m.body.Value())
-			if title == "" {
-				m.err = "title cannot be empty"
-				return m, nil
-			}
-			m.creating = true
-			return m, createPRCmd(m.path, m.draft.Base, m.draft.Head, title, body)
 		}
 	}
 
@@ -2383,7 +2430,7 @@ func (m createPRModel) View() string {
 	if m.creating {
 		sb.WriteString("\n" + dimStyle.Render("Creating PR…") + "\n")
 	}
-	sb.WriteString("\n" + helpStyle.Render("tab  switch fields   ctrl+s  create PR   esc  cancel"))
+	sb.WriteString("\n" + helpStyle.Render(m.keys.NextField.Label()+"  switch fields   "+m.keys.Create.Label()+"  create PR   esc  cancel"))
 	return sb.String()
 }
 

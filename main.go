@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 )
 
 func main() {
@@ -31,6 +32,9 @@ func main() {
 		case "--pin-preview":
 			runPinPreview()
 			return
+		case "--layout":
+			applyLayout()
+			return
 		case "--pr-details":
 			if len(os.Args) > 2 {
 				runPRDetails(os.Args[2])
@@ -55,14 +59,19 @@ func launch() {
 			st.AddProject(root)
 			// Remember the worktree we launched from so the sidebar defaults
 			// its cursor to it instead of the first item in the list.
-			st.LaunchWorktree = filepath.Clean(root)
+			if wt, err := gitWorktreeRoot(wd); err == nil {
+				st.LaunchWorktree = filepath.Clean(wt)
+			}
 		}
 	}
 
 	if tmuxSessionExists("gw") {
 		saveState(st)
-		// Redeploy the monitor script so a rebuilt binary's notification logic
-		// takes effect on reattach without killing the session.
+		// Redeploy the scripts and the session configuration so that a rebuilt
+		// binary takes effect on reattach without killing the session.
+		if bin, err := os.Executable(); err == nil {
+			configureSession(bin)
+		}
 		refreshMonitorPane()
 		cmd := exec.Command("tmux", "attach-session", "-t", "gw")
 		cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
@@ -91,6 +100,9 @@ func launch() {
 	setupTmuxSession()
 }
 
+// historyLimit is the scrollback of each pane, in lines.
+const historyLimit = "50000"
+
 func setupTmuxSession() {
 	bin, err := os.Executable()
 	if err != nil {
@@ -98,44 +110,24 @@ func setupTmuxSession() {
 		os.Exit(1)
 	}
 
-	// Window "active": pane 0 = sidebar TUI, pane 1 = current worktree.
+	// Window "active": pane 0 = sidebar TUI, pane 1 = current worktree. One tmux
+	// command, because the sidebar starts at once and switches worktrees into
+	// pane 1. history-limit applies only to panes created later, so it comes first.
 	if err := exec.Command("tmux", "new-session", "-d", "-s", "gw", "-n", "active",
-		bin, "--sidebar").Run(); err != nil {
+		bin, "--sidebar",
+		";", "set-option", "-t", "gw", "history-limit", historyLimit,
+		";", "split-window", "-t", "gw:active.0", "-h", shellBin(), "-l").Run(); err != nil {
 		fmt.Fprintln(os.Stderr, "gw: tmux:", err)
 		os.Exit(1)
 	}
 
-	sh := shellBin()
-	exec.Command("tmux", "split-window", "-t", "gw:active.0", "-h", sh, "-l").Run()
+	configureSession(bin)
 
 	// Keep pane 1 alive even after shell exits (e.g., ^D).
 	exec.Command("tmux", "set-option", "-t", "gw:active.1", "remain-on-exit", "on").Run()
-	// Hook to respawn pane 1 if it dies (fallback if remain-on-exit isn't enough).
-	exec.Command("tmux", "set-hook", "-t", "gw", "pane-died",
-		"run-shell '"+bin+" --handle-pane-dead'").Run()
 	exec.Command("tmux", "select-pane", "-t", "gw:active.0").Run()
 
-	// Session-scoped options.
-	for _, opt := range [][]string{
-		{"prefix", "C-a"},
-		{"mouse", "on"},
-		{"status", "off"},
-		{"pane-border-style", "fg=colour238"},
-		{"pane-active-border-style", "fg=colour99"},
-		// Prevent tmux from renaming windows — we rely on exact names for lookup.
-		{"automatic-rename", "off"},
-		{"allow-rename", "off"},
-	} {
-		exec.Command("tmux", "set-option", "-t", "gw", opt[0], opt[1]).Run()
-	}
-	// Allow sending a literal C-a to the running program via ^w ^w.
-	exec.Command("tmux", "bind-key", "-T", "prefix", "C-a", "send-prefix").Run()
-
-	// Pin sidebar to 30 cols now and on every future re-attach
-	// (without the hook, re-attaching from a wider terminal rescales the layout).
-	exec.Command("tmux", "resize-pane", "-t", "gw:active.0", "-x", "40").Run()
-	exec.Command("tmux", "set-hook", "-t", "gw", "client-resized",
-		"resize-pane -t gw:active.0 -x 40").Run()
+	applyLayout()
 
 	// Bottom status bar on the right pane showing sub-window tabs.
 	exec.Command("tmux", "set-window-option", "-t", "gw:active", "pane-border-status", "bottom").Run()
@@ -143,17 +135,56 @@ func setupTmuxSession() {
 		"#[align=centre]#{pane_title}").Run()
 	exec.Command("tmux", "select-pane", "-t", "gw:active.0", "-T", "").Run()
 
-	// Sub-window keybindings (^a c/x/n/p) and sidebar focus (^a s).
-	exec.Command("tmux", "bind-key", "c", "run-shell", bin+" --new-subwindow").Run()
-	exec.Command("tmux", "bind-key", "x", "run-shell", bin+" --close-subwindow").Run()
-	exec.Command("tmux", "bind-key", "n", "run-shell", bin+" --next-subwindow").Run()
-	exec.Command("tmux", "bind-key", "p", "run-shell", bin+" --prev-subwindow").Run()
-	exec.Command("tmux", "bind-key", "s", "select-pane", "-t", "gw:active.0").Run()
-	exec.Command("tmux", "bind-key", "b", "run-shell", bin+" --pin-preview").Run()
-
 	cmd := exec.Command("tmux", "attach-session", "-t", "gw")
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
 	cmd.Run()
+}
+
+// configureSession sets the options, hooks and keybindings. It runs on every launch
+// and reattach, so that a rebuilt binary or an edited config.json takes effect
+// without killing the session.
+func configureSession(bin string) {
+	self := shellQuote(bin)
+	// A config error shows in the sidebar, which loads the same file.
+	cfg, _ := loadConfig()
+	prefix := tmuxKey(cfg.Tmux.Prefix)
+
+	// Hook to respawn pane 1 if it dies (fallback if remain-on-exit isn't enough).
+	exec.Command("tmux", "set-hook", "-t", "gw", "pane-died",
+		"run-shell "+tmuxQuote(self+" --handle-pane-dead")).Run()
+
+	// Session-scoped options.
+	for _, opt := range [][]string{
+		{"prefix", prefix},
+		{"mouse", "on"},
+		{"status", "off"},
+		{"pane-border-style", "fg=colour238"},
+		{"pane-active-border-style", "fg=colour99"},
+		// Prevent tmux from renaming windows — we rely on exact names for lookup.
+		{"automatic-rename", "off"},
+		{"allow-rename", "off"},
+		// Terminal search and scrollback cannot see pane history, so an agent's
+		// long transcript must fit here.
+		{"history-limit", historyLimit},
+	} {
+		exec.Command("tmux", "set-option", "-t", "gw", opt[0], opt[1]).Run()
+	}
+	if runtime.GOOS == "darwin" {
+		// Copy straight to the macOS clipboard. OSC 52 is off because iTerm2
+		// refuses it by default, which would leave a selection uncopied.
+		exec.Command("tmux", "set-option", "-s", "copy-command", "pbcopy").Run()
+		exec.Command("tmux", "set-option", "-s", "set-clipboard", "off").Run()
+	}
+	// Allow sending a literal prefix key to the running program by pressing it twice.
+	exec.Command("tmux", "bind-key", "-T", "prefix", prefix, "send-prefix").Run()
+
+	// Size the panes for the window now and on every future attach or resize.
+	layout := "run-shell " + tmuxQuote(self+" --layout")
+	exec.Command("tmux", "set-hook", "-t", "gw", "client-resized", layout).Run()
+	exec.Command("tmux", "set-hook", "-t", "gw", "client-attached", layout).Run()
+
+	bindTmuxKeys(self, cfg)
+	exec.Command("tmux", "bind-key", "b", "run-shell", self+" --pin-preview").Run()
 }
 
 func runNewSubwindow() {
